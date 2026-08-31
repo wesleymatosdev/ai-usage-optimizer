@@ -8,9 +8,9 @@
 //! as of Aug 2026). Claude Pro is estimated from local JSONL session logs. Z.ai
 //! CodePlus has a real quota endpoint, polled when ZAI_API_KEY is set.
 
+mod collectors;
 mod config;
 mod db;
-mod collectors;
 
 use std::env;
 use std::path::PathBuf;
@@ -23,9 +23,11 @@ fn usage() -> &'static str {
 Commands:\n  \
   init                              Print config path (creates default config if missing)\n  \
   status                            Show latest known state + recommendation for all providers\n  \
-  collect                           Run automatic collectors (Claude JSONL, Z.ai API), then show status\n  \
+  collect                           Run automatic collectors (Claude, Z.ai API), then show status\n  \
+  recommend [--json]                Machine-readable routing recommendation (optional JSON)\n  \
   observe <provider> <percent> [--note TEXT]   Record a manual usage observation (0-100)\n  \
-  limit-hit <provider> [--note TEXT]           Record that a provider just returned a 429/limit error\n\n\
+  limit-hit <provider> [--note TEXT]           Record that a provider just returned a 429/limit error\n  \
+  start-window                       Start Claude's 5h limit clock now (cheap haiku ping)\n\n\
 Providers: claude-pro, zai-codeplus, chatgpt-plus, ollama-pro\n"
 }
 
@@ -38,11 +40,18 @@ fn default_db_path() -> PathBuf {
 }
 
 fn dirs_config() -> PathBuf {
-    env::var_os("HOME").map(PathBuf::from).unwrap_or_default().join(".config")
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default()
+        .join(".config")
 }
 
 fn dirs_data() -> PathBuf {
-    env::var_os("HOME").map(PathBuf::from).unwrap_or_default().join(".local").join("share")
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default()
+        .join(".local")
+        .join("share")
 }
 
 fn main() -> ExitCode {
@@ -83,6 +92,38 @@ fn main() -> ExitCode {
         "collect" => {
             run_collect(&conn, &cfg);
             print_status(&conn, &cfg);
+            ExitCode::SUCCESS
+        }
+        "recommend" => {
+            let json_mode = args[2..].iter().any(|a| a == "--json");
+            let states = db::latest(&conn);
+            let rec = recommendation(&cfg, &states);
+            if json_mode {
+                let candidates: Vec<serde_json::Value> = cfg
+                    .rotation_order
+                    .iter()
+                    .filter_map(|p| {
+                        states.get(p).map(|s| {
+                            serde_json::json!({
+                                "provider": p,
+                                "percent": s.percent,
+                                "source": s.source,
+                                "note": s.note,
+                                "has_headroom": s.percent.map_or(false, |pct| pct < cfg.thresholds.warning),
+                            })
+                        })
+                    })
+                    .collect();
+                let out = serde_json::json!({
+                    "recommended": rec.provider,
+                    "headroom_percent": rec.headroom,
+                    "message": rec.text,
+                    "candidates": candidates,
+                });
+                println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+            } else {
+                println!("{}", rec.text);
+            }
             ExitCode::SUCCESS
         }
         "observe" => {
@@ -133,6 +174,25 @@ fn main() -> ExitCode {
             println!("recorded");
             ExitCode::SUCCESS
         }
+        "start-window" => {
+            // Start Claude's 5h clock NOW with a cheap haiku ping, then observe
+            // the fresh window so the tracker reflects it immediately.
+            match collectors::claude::start_window() {
+                Ok(note) => {
+                    if let Err(e) =
+                        db::observe(&conn, "claude-pro", Some(0.0), "window-start", &note)
+                    {
+                        eprintln!("db error: {e}");
+                    }
+                    println!("{note}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         other => {
             eprintln!("unknown command: {other}\n");
             eprint!("{}", usage());
@@ -152,8 +212,8 @@ fn extract_note(rest: &[String]) -> Option<String> {
 }
 
 fn run_collect(conn: &rusqlite::Connection, cfg: &config::Config) {
-    let (pct, note) = collectors::claude::collect(cfg);
-    if let Err(e) = db::observe(conn, "claude-pro", Some(pct), "local-jsonl", &note) {
+    let (pct, source, note) = collectors::claude::collect(cfg);
+    if let Err(e) = db::observe(conn, "claude-pro", Some(pct), &source, &note) {
         eprintln!("db error recording claude-pro: {e}");
     }
 
@@ -173,29 +233,54 @@ fn print_status(conn: &rusqlite::Connection, cfg: &config::Config) {
     for provider in PROVIDERS {
         match states.get(provider) {
             Some(s) => {
-                let pct = s.percent.map(|p| format!("{p:5.1}%")).unwrap_or_else(|| " unset".to_string());
+                let pct = s
+                    .percent
+                    .map(|p| format!("{p:5.1}%"))
+                    .unwrap_or_else(|| " unset".to_string());
                 println!("{provider:14} {pct}  {}  {}", s.source, s.note);
             }
             None => println!("{provider:14} unknown — no observation"),
         }
     }
     let rec = recommendation(cfg, &states);
-    println!("{rec}");
-    fire_alerts(conn, cfg, &states, &rec);
+    println!("{}", rec.text);
+    fire_alerts(conn, cfg, &states, &rec.text);
 }
 
-fn recommendation(cfg: &config::Config, states: &std::collections::HashMap<String, db::Observation>) -> String {
+/// A routing recommendation: which provider to send the next task to.
+struct Recommendation {
+    provider: Option<String>,
+    headroom: f64,
+    text: String,
+}
+
+fn recommendation(
+    cfg: &config::Config,
+    states: &std::collections::HashMap<String, db::Observation>,
+) -> Recommendation {
     let mut candidates: Vec<(f64, &str)> = cfg
         .rotation_order
         .iter()
         .filter_map(|p| {
-            states.get(p).and_then(|s| s.percent).filter(|&pct| pct < 90.0).map(|pct| (pct, p.as_str()))
+            states
+                .get(p)
+                .and_then(|s| s.percent)
+                .filter(|&pct| pct < cfg.thresholds.warning)
+                .map(|pct| (pct, p.as_str()))
         })
         .collect();
     candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
     match candidates.first() {
-        Some((pct, provider)) => format!("Recommended next: {provider} ({:.0}% verified headroom).", 100.0 - pct),
-        None => "No provider has verified headroom. Record a current consumer-subscription observation before switching.".to_string(),
+        Some((pct, provider)) => Recommendation {
+            provider: Some(provider.to_string()),
+            headroom: 100.0 - pct,
+            text: format!("Recommended next: {provider} ({:.0}% verified headroom).", 100.0 - pct),
+        },
+        None => Recommendation {
+            provider: None,
+            headroom: 0.0,
+            text: "No provider has verified headroom. Record a current consumer-subscription observation before switching.".to_string(),
+        },
     }
 }
 
@@ -210,7 +295,11 @@ fn fire_alerts(
         if pct < cfg.thresholds.warning {
             continue;
         }
-        let level = if pct >= cfg.thresholds.critical { "critical" } else { "warning" };
+        let level = if pct >= cfg.thresholds.critical {
+            "critical"
+        } else {
+            "warning"
+        };
         let message = format!("{provider} at {pct:.0}% — {rec}");
         if let Err(e) = db::alert(conn, provider, level, pct, &message) {
             eprintln!("db error recording alert: {e}");

@@ -14,7 +14,9 @@ pub struct Observation {
 }
 
 pub fn now_iso() -> String {
-    let dur = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let dur = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     // Minimal RFC3339-ish UTC timestamp, no external chrono dependency.
     let secs = dur.as_secs();
     let days = secs / 86400;
@@ -104,7 +106,13 @@ pub fn latest(conn: &Connection) -> HashMap<String, Observation> {
     out
 }
 
-pub fn alert(conn: &Connection, provider: &str, level: &str, percent: f64, message: &str) -> SqlResult<()> {
+pub fn alert(
+    conn: &Connection,
+    provider: &str,
+    level: &str,
+    percent: f64,
+    message: &str,
+) -> SqlResult<()> {
     conn.execute(
         "INSERT INTO alerts (provider, level, percent, message, fired_at) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![provider, level, percent, message, now_iso()],
