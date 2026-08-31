@@ -9,7 +9,7 @@
 
 ## 1. Problem
 
-Wesley uses five AI subscriptions/providers — **Claude (Pro/Max via Claude Code)**, **OpenAI**, **GLM via Z.ai**, **DeepSeek**, and **Ollama (local)** — and tracks usage manually via bookmarks. Limits and billing models differ per provider: rolling 5-hour windows, weekly quotas, prepaid token packages, cash balances, and unlimited-but-local. On 2026-08-30, GLM-5.3 Flash on Z.ai returned a 429 mid-session because the Coding Plan quota was exhausted with no warning. The goal is a local daemon that polls each provider's usage signal, computes percentage-of-limit, fires alerts at 90% and 95%, and recommends switching to a provider with headroom.
+The author uses five AI subscriptions/providers — **Claude (Pro/Max via Claude Code)**, **OpenAI**, **GLM via Z.ai**, **DeepSeek**, and **Ollama (local)** — and tracks usage manually via bookmarks. Limits and billing models differ per provider: rolling 5-hour windows, weekly quotas, prepaid token packages, cash balances, and unlimited-but-local. On 2026-08-30, GLM-5.3 Flash on Z.ai returned a 429 mid-session because the Coding Plan quota was exhausted with no warning. The goal is a local daemon that polls each provider's usage signal, computes percentage-of-limit, fires alerts at 90% and 95%, and recommends switching to a provider with headroom.
 
 ---
 
@@ -43,7 +43,7 @@ Each provider was researched for what usage/billing data is programmatically acc
 **How the tool will get data:**
 - **Primary:** Parse `~/.claude/projects/**/*.jsonl` locally (same approach as `ccusage`). Aggregate tokens per 5-hour window and per rolling 7-day week. Compare against plan limits from config.
 - **Secondary (optional):** Read `~/.claude/.credentials.json` for plan tier to auto-detect limits.
-- **API users (if Wesley ever uses API key):** Anthropic Admin API `GET /v1/organizations/usage_report/messages` with `sk-ant-admin01-` key, `anthropic-version: 2023-06-01`. Supports `bucket_width=1m|1h|1d`, `group_by[]=model`, `workspace_ids[]`, `service_tier`. Cost endpoint: `GET /v1/organizations/cost_report`.
+- **API users:** Anthropic Admin API `GET /v1/organizations/usage_report/messages` with `***` key, `anthropic-version: 2023-06-01`. Supports `bucket_width=1m|1h|1d`, `group_by[]=model`, `workspace_ids[]`, `service_tier`. Cost endpoint: `GET /v1/organizations/cost_report`.
 
 **Reference endpoints:**
 ```
@@ -159,7 +159,7 @@ curl -sS \
 
 ### 3.1 Design Principles
 
-1. **Local-first, zero-cloud.** All data stays on Wesley's machine. No telemetry, no SaaS dashboard. SQLite + local files.
+1. **Local-first, zero-cloud.** All data stays on your machine. No telemetry, no SaaS dashboard. SQLite + local files.
 2. **Zero-API-key for local providers.** Claude Code (local JSONL) and Ollama (local proxy) require no keys. Remote providers (OpenAI, Z.ai, DeepSeek) need keys stored in a local env file or OS keychain — never transmitted anywhere except the provider's own API.
 3. **Pluggable providers.** Each provider is a "collector" module implementing a common interface. Adding a new provider = adding one module.
 4. **Poll-based, not push.** A local daemon polls each provider at its own interval. No webhooks to expose, no inbound ports.
@@ -417,7 +417,7 @@ Compare against plan limits (from config or ~/.claude/.credentials.json):
 Limit %: max(five_hour_pct, weekly_pct)
 ```
 
-**Note:** Claude Code's 5h/weekly limits are not published as fixed token counts — they're dynamic and depend on model mix, context size, and server-side load. The config file lets Wesley calibrate from observed `/usage` bars. The tool can also parse the `/usage` TUI output if Claude Code is run in a controlled terminal (fragile, not recommended).
+**Note:** Claude Code's 5h/weekly limits are not published as fixed token counts — they're dynamic and depend on model mix, context size, and server-side load. The config file lets you calibrate from observed `/usage` bars. The `/usage` command is interactive-only (TUI); there is no stdout/JSON mode and no CLI flag to force a cache refresh. Whether sending a message (`claude -p`) refreshes the server cache is undetermined — needs manual testing (wait for cache expiry, send a message, observe whether `resets_at` updates to a fresh 5h window).
 
 ### 4.2 OpenAI Collector
 
@@ -574,7 +574,7 @@ This lets Hermes Agent proactively suggest switches during coding sessions.
 
 ## 8. Deployment
 
-### 8.1 macOS (Wesley's setup)
+### 8.1 macOS
 
 ```bash
 # Install

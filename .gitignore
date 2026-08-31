@@ -3,3 +3,4 @@ ai-usage-rs/target/
 __pycache__/
 .venv/
 data/
+.hermes.md

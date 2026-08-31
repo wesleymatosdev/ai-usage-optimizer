@@ -1,6 +1,6 @@
 //! Telegram alerting — pushes only on level TRANSITIONS per provider.
 //!
-//! Alert design (Wesley's error-interface rule): a non-happy-path message must
+//! Alert design (non-happy-path rule): a non-happy-path message must
 //! answer three things —
 //!   1. what happened (provider, percent, level, and the actual cause),
 //!   2. what it means for you (dispatches there will fail / work again),
