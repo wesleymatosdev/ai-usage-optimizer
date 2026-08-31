@@ -1,0 +1,12 @@
+commit e698c50bfe2f5af7e7176cc3de45d6ce72d94122
+Author: Wesley Matos <wesleymatos@users.noreply.github.com>
+Date:   Sun Aug 30 23:22:58 2026 -0300
+
+    feat: add AI subscription usage MVP
+
+ DESIGN.md            | 672 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ README.md            |  29 +++
+ ai_usage/__init__.py |   1 +
+ ai_usage/__main__.py | 161 ++++++++++++
+ tests/test_mvp.py    |  23 ++
+ 5 files changed, 886 insertions(+)

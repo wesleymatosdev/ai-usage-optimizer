@@ -1,0 +1,38 @@
+# AI Usage Optimizer — MVP config
+# Providers tracked automatically vs manually (see README for why).
+
+providers:
+  claude_code:
+    tracked: automatic       # local JSONL parsing, zero API key
+    estimated_limits:
+      # PLACEHOLDER — Anthropic does not publish token limits for Pro/Max.
+      # Calibrate by running `/usage` in Claude Code and comparing against
+      # `python3 src/collectors/claude_code.py` output at the same moment.
+      5h_tokens: null
+      weekly_tokens: null
+
+  zai_codeplus:
+    tracked: automatic_pending_key   # real API exists, needs ZAI_API_KEY
+    api_key_env: ZAI_API_KEY
+    endpoint: https://api.z.ai/api/monitor/usage/quota/limit
+
+  ollama_cloud:
+    tracked: manual           # confirmed: no usage API exists (GitHub #15663, #16448)
+    reset_hint: "5h session window + 7d weekly window (per ollama.com plan page)"
+
+  chatgpt_plus:
+    tracked: manual           # consumer plan, zero usage API of any kind
+    reset_hint: "unknown — OpenAI publishes no reset schedule for Plus"
+
+alert:
+  thresholds: [90, 95]
+  channels: [telegram, memory]
+
+rotation:
+  # Order to recommend switching into when the active provider crosses 90%.
+  # Manual-tracked providers are assumed 'available' until you mark them exhausted.
+  priority:
+    - claude_code
+    - zai_codeplus
+    - ollama_cloud
+    - chatgpt_plus
