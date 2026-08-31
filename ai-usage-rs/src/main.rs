@@ -17,7 +17,13 @@ use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-const PROVIDERS: [&str; 4] = ["claude-pro", "zai-codeplus", "chatgpt-plus", "ollama-pro"];
+const PROVIDERS: [&str; 5] = [
+    "claude-pro",
+    "zai-codeplus",
+    "chatgpt-plus",
+    "ollama-pro",
+    "ollama-local",
+];
 
 fn usage() -> &'static str {
     "ai-usage — AI subscription usage tracker\n\n\
@@ -30,7 +36,7 @@ Commands:\n  \
   limit-hit <provider> [--note TEXT]           Record that a provider just returned a 429/limit error\n  \
   start-window                     Start Claude's 5h limit clock now (cheap haiku ping)\n  \
   alert                            Push Telegram alerts on level transitions (ok/warning/critical)\n\
-\nProviders: claude-pro, zai-codeplus, chatgpt-plus, ollama-pro\n"
+\nProviders: claude-pro, zai-codeplus, chatgpt-plus, ollama-pro, ollama-local\n\nNote: --note TEXT is visible via `ps` and shell history. Do not include\nsecrets, tokens, or sensitive context in note arguments.\n"
 }
 
 fn default_config_path() -> PathBuf {
@@ -262,6 +268,21 @@ fn run_collect(conn: &rusqlite::Connection, cfg: &config::Config) {
         }
         Ok(None) => eprintln!("ZAI_API_KEY is not set"),
         Err(e) => eprintln!("Z.ai quota request failed: {e}"),
+    }
+
+    match collectors::ollama::collect() {
+        Ok(snapshot) => {
+            if let Err(e) = db::observe(
+                conn,
+                "ollama-local",
+                Some(snapshot.percent),
+                &snapshot.source,
+                &snapshot.note,
+            ) {
+                eprintln!("db error recording ollama-local: {e}");
+            }
+        }
+        Err(error) => eprintln!("Ollama local capacity unavailable: {error}"),
     }
 }
 

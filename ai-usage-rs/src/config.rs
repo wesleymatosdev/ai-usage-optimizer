@@ -29,6 +29,16 @@ pub struct Config {
     pub providers: std::collections::HashMap<String, ProviderConfig>,
 }
 
+fn ollama_local_config() -> ProviderConfig {
+    ProviderConfig {
+        kind: "ollama_local".to_string(),
+        five_hour_token_budget: None,
+        api_key_env: None,
+        endpoint: Some("http://localhost:11434/api/tags".to_string()),
+        note: Some("Local Ollama models are unmetered.".to_string()),
+    }
+}
+
 impl Config {
     pub fn default_config() -> Self {
         let mut providers = std::collections::HashMap::new();
@@ -36,13 +46,12 @@ impl Config {
             "claude-pro".to_string(),
             ProviderConfig {
                 kind: "claude_local".to_string(),
-                // PLACEHOLDER — Anthropic publishes no numeric limit for Pro/Max.
-                // Calibrate: run `/usage` in Claude Code, compare against
-                // `ai-usage collect` raw token count at the same moment, back-solve.
+                // PLACEHOLDER — used only when Hermes OAuth and cache calibration
+                // are both unavailable.
                 five_hour_token_budget: Some(225_000),
                 api_key_env: None,
                 endpoint: None,
-                note: None,
+                note: Some("Exact OAuth quota via Hermes when available.".to_string()),
             },
         );
         providers.insert(
@@ -58,13 +67,11 @@ impl Config {
         providers.insert(
             "chatgpt-plus".to_string(),
             ProviderConfig {
-                kind: "manual".to_string(),
+                kind: "hermes_account_quota".to_string(),
                 five_hour_token_budget: None,
                 api_key_env: None,
                 endpoint: None,
-                note: Some(
-                    "ChatGPT consumer subscriptions have no supported usage API.".to_string(),
-                ),
+                note: Some("Exact Codex quota via Hermes OAuth when available.".to_string()),
             },
         );
         providers.insert(
@@ -79,6 +86,7 @@ impl Config {
                 ),
             },
         );
+        providers.insert("ollama-local".to_string(), ollama_local_config());
 
         Config {
             thresholds: Thresholds {
@@ -90,6 +98,7 @@ impl Config {
                 "zai-codeplus".to_string(),
                 "chatgpt-plus".to_string(),
                 "ollama-pro".to_string(),
+                "ollama-local".to_string(),
             ],
             providers,
         }
@@ -107,5 +116,61 @@ pub fn load_or_init(path: &Path) -> io::Result<Config> {
         return Ok(cfg);
     }
     let text = fs::read_to_string(path)?;
-    serde_json::from_str(&text).map_err(io::Error::other)
+    let mut config: Config = serde_json::from_str(&text).map_err(io::Error::other)?;
+    config
+        .providers
+        .entry("ollama-local".to_string())
+        .or_insert_with(ollama_local_config);
+    if !config
+        .rotation_order
+        .iter()
+        .any(|provider| provider == "ollama-local")
+    {
+        config.rotation_order.push("ollama-local".to_string());
+    }
+    Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::load_or_init;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn migrates_existing_config_to_include_ollama_local() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("ai-usage-config-{unique}"));
+        fs::create_dir_all(&root).expect("temp directory");
+        let path = root.join("config.json");
+        fs::write(
+            &path,
+            r#"{
+              "thresholds":{"warning":90,"critical":95},
+              "rotation_order":["claude-pro","ollama-pro"],
+              "providers":{
+                "claude-pro":{"kind":"claude_local"},
+                "ollama-pro":{"kind":"manual"}
+              }
+            }"#,
+        )
+        .expect("old config");
+
+        let config = load_or_init(&path).expect("migrated config");
+        assert_eq!(
+            config
+                .providers
+                .get("ollama-local")
+                .map(|provider| provider.kind.as_str()),
+            Some("ollama_local")
+        );
+        assert!(config
+            .rotation_order
+            .iter()
+            .any(|provider| provider == "ollama-local"));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
 }
