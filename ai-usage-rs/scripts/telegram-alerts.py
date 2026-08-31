@@ -79,12 +79,24 @@ def main():
         print("no level changes")
         return
 
+    # Pull latest percent + note per provider so pushes are self-explanatory.
+    conn = sqlite3.connect(DB)
+    details = dict(
+        conn.execute(
+            "SELECT o.provider, o.percent || '% — ' || COALESCE(o.note, '') FROM observations o "
+            "JOIN (SELECT provider, MAX(id) AS id FROM observations GROUP BY provider) x "
+            "ON o.id = x.id"
+        ).fetchall()
+    )
+    conn.close()
+
     for provider, lvl in sorted(changes.items()):
         old = previous.get(provider, "unknown")
+        detail = details.get(provider, "")
         if lvl == "ok":
-            msg = f"ai-usage: {provider} recovered (was {old})"
+            msg = f"ai-usage: {provider} back under {WARNING:.0f}% (was {old}). Now: {detail}"
         else:
-            msg = f"ai-usage: {provider} -> {lvl} (was {old})"
+            msg = f"ai-usage: {provider} hit {lvl.upper()} threshold (was {old}). Now: {detail}"
         if send_telegram(msg):
             print(f"pushed: {msg}")
         previous[provider] = lvl
