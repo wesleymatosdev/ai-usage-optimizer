@@ -126,7 +126,10 @@ fn send_telegram(text: &str) -> bool {
     match ureq::post(&url).send_json(payload) {
         Ok(r) => r.status() == 200,
         Err(e) => {
-            eprintln!("telegram send failed: {e}");
+            // ureq's Display includes the request URL, which embeds the bot
+            // token (Telegram puts it in the path) — redact before logging.
+            let msg = e.to_string().replace(&token, "***");
+            eprintln!("telegram send failed: {msg}");
             false
         }
     }
