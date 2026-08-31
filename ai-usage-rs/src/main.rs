@@ -1,12 +1,12 @@
-//! AI Usage Optimizer — tracks usage across AI subscriptions (Claude Pro, Z.ai
-//! CodePlus, ChatGPT Plus, Ollama Pro) and recommends which one has headroom.
+//! AI Usage Optimizer — combines exact Hermes OAuth account quotas, direct
+//! provider APIs, local estimates, and unmetered local capacity to recommend
+//! which route has headroom.
 //!
 //! Zero cloud dependency: SQLite storage under ~/.local/share/ai-usage-optimizer/,
-//! JSON config under ~/.config/ai-usage-optimizer/. Two providers (ChatGPT Plus,
-//! Ollama Pro) are manual-only — neither exposes a usage API for consumer plans
-//! (confirmed via GitHub issues ollama/ollama#15663, #16448 — both open/duplicate
-//! as of Aug 2026). Claude Pro is estimated from local JSONL session logs. Z.ai
-//! CodePlus has a real quota endpoint, polled when ZAI_API_KEY is set.
+//! JSON config under ~/.config/ai-usage-optimizer/. Hermes supplies exact
+//! ChatGPT Codex and Anthropic OAuth windows without exposing credentials;
+//! Z.ai has a direct quota endpoint; local Ollama models are unmetered. Ollama
+//! cloud remains manual because it exposes no documented subscription quota.
 
 mod alert;
 mod collectors;

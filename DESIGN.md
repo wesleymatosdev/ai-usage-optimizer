@@ -1,6 +1,6 @@
 # AI Subscription Usage Optimizer — Design Document
 
-**Status:** Design (not implemented)
+**Status:** Implemented in Rust; this document retains the original research and records later discoveries.
 **Owner:** Wesley Matos
 **Date:** 2026-08-30
 **Goals:** Self-hosted, local-first, zero-cloud, OSS. Track usage across multiple AI providers, alert at 90%/95% thresholds, recommend model switches before limits are hit.
@@ -21,12 +21,12 @@ Each provider was researched for what usage/billing data is programmatically acc
 
 | Provider | Usage Signal | Access Method | Auth | Freshness | Limit Type | Key Gap |
 |---|---|---|---|---|---|---|
-| **Claude Code (Pro/Max)** | Plan usage % (5h window + weekly), per-session tokens | Local JSONL parse (`~/.claude/projects/`); `/usage` is in-CLI only | None (local files) | Real-time (local) | Rolling 5h + weekly | No HTTP API for subscription %; must parse local files or screen-scrape |
+| **Claude Code (Pro/Max)** | Plan usage % (5h window + weekly), per-session tokens | Hermes OAuth usage adapter; local cache/JSONL fallback | Existing Hermes OAuth | Live when Dashboard is running | Rolling 5h + weekly | OAuth endpoint is not a public standalone API; delegate auth to Hermes |
 | **Claude (API / Console)** | Token usage + cost, per model/workspace | Admin API `GET /v1/organizations/usage_report/messages` | `sk-ant-admin01-` key | ~delayed (hours) | Spend $ | Requires org/admin key; not for Pro/Max subs |
 | **OpenAI** | Token usage + cost, per model/project/user | `GET /v1/organization/usage/completions` + `GET /v1/organization/costs` | Admin API key (`Authorization: Bearer`) | Near real-time | Spend $ / rate tier | Requires admin key; per-project filtering available |
 | **Z.ai (GLM Coding Plan)** | Token usage % (5h), MCP usage % (monthly), per-model 24h tokens | `GET /api/monitor/usage/quota/limit`, `GET /api/monitor/usage/model-usage` | API key (no Bearer prefix) | Real-time | Rolling 5h + monthly | **Standard API (non-Coding-Plan) has NO billing API** — only Coding Plan |
 | **DeepSeek** | Cash balance (total, granted, topped-up) | `GET /user/balance` | `Bearer` API key | Near real-time | Cash balance | **No spend/quota API** — balance only; no period-to-date cost |
-| **Ollama** | Per-response tokens (`prompt_eval_count`, `eval_count`) | `/api/generate`, `/api/chat` response fields; `/api/ps` for loaded models | None (local) | Real-time | Unlimited (local) | **No aggregated stats endpoint** — must intercept/log per-call |
+| **Ollama** | Local capacity plus per-response tokens (`prompt_eval_count`, `eval_count`) | `/api/tags` for unmetered fallback availability; response fields for token accounting | None (local) | Real-time | Unlimited (local) | **No aggregated stats endpoint** — detailed usage still needs interception |
 
 ### 2.2 Claude Code (Pro/Max subscription) — Detail
 
@@ -69,8 +69,11 @@ GET https://api.anthropic.com/v1/organizations/cost_report
 - Auth: `Authorization: Bearer $OPENAI_ADMIN_KEY` (admin key, not project key). Requires "Usage Dashboard" permission or org owner.
 - Additional endpoints exist for `audio_speeches`, `audio_transcriptions`, `embeddings`, `images`, `code_interpreter_sessions`, `vector_stores`.
 
-**What's NOT available:**
-- No "subscription limit" or "ChatGPT Plus/Pro quota %" — this is API spend only. ChatGPT consumer subscriptions have no usage API.
+**Later discovery:** Hermes's native `openai-codex` OAuth adapter can read the
+Codex allowance attached to ChatGPT Plus (session and weekly windows). This is
+not ordinary ChatGPT conversation usage and is not the OpenAI Admin Usage API.
+The optimizer consumes Hermes's authenticated loopback normalization instead of
+duplicating OAuth token resolution or refresh logic.
 
 **How the tool will get data:**
 - Poll `/organization/costs` daily for spend tracking. Poll `/organization/usage/completions` with `bucket_width=1h` for token velocity. Compare against configured monthly budget.

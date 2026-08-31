@@ -18,10 +18,16 @@ verified headroom visibility so you can route work before limits bite.
 
 | Provider | Tracking | Real signal? |
 |---|---|---|
-| Claude Pro | Automatic — server cache from `~/.claude.json` + local JSONL fallback | Yes (server-reported 5h/weekly %, auto-calibrated token estimate between refreshes) |
+| Claude Pro | Automatic — exact Hermes OAuth quota, then server cache + local JSONL fallback | Yes (5h/weekly account windows when Hermes is available) |
 | Z.ai CodePlus | Automatic, needs `GLM_API_KEY` or `ZAI_API_KEY` env var | Yes (real quota endpoint, polled live) |
-| ChatGPT Plus | Manual only | No usage API exists for consumer plans |
-| Ollama Pro | Manual only | No usage API exists (confirmed via GitHub ollama/ollama#15663, #16448) |
+| ChatGPT Plus / Codex | Automatic through Hermes OAuth | Yes (session/weekly Codex allowance; not ordinary ChatGPT conversation usage) |
+| Ollama Pro cloud | Manual only | No documented subscription-quota endpoint |
+| Ollama local | Automatic | Yes (reachable local models are unmetered fallback capacity) |
+
+Exact ChatGPT and Anthropic collection requires a running Hermes Dashboard
+with the `ai-usage-monitor` plugin enabled. The tracker reads only the plugin's
+authenticated loopback API: Hermes keeps OAuth credentials and refresh logic;
+the tracker stores normalized percentages, reset times, and safe details.
 
 ## Build & run
 
@@ -95,8 +101,10 @@ ai-usage-rs/
     db.rs          SQLite storage (observations, alerts)
     alert.rs       Telegram alerter (transitions, cooldown, cause/consequence/action)
     collectors/
+      hermes.rs    authenticated loopback bridge for ChatGPT/Anthropic quotas
       claude.rs    ~/.claude.json cache + JSONL fallback + window start
       zai.rs       Z.ai quota endpoint
+      ollama.rs    local-model availability and unmetered fallback capacity
   scripts/
     collect-cron.sh  env-sourcing + collect + alert (for launchd)
 ```
