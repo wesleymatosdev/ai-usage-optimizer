@@ -8,6 +8,7 @@
 //! as of Aug 2026). Claude Pro is estimated from local JSONL session logs. Z.ai
 //! CodePlus has a real quota endpoint, polled when ZAI_API_KEY is set.
 
+mod alert;
 mod collectors;
 mod config;
 mod db;
@@ -27,8 +28,9 @@ Commands:\n  \
   recommend [--json]                Machine-readable routing recommendation (optional JSON)\n  \
   observe <provider> <percent> [--note TEXT]   Record a manual usage observation (0-100)\n  \
   limit-hit <provider> [--note TEXT]           Record that a provider just returned a 429/limit error\n  \
-  start-window                       Start Claude's 5h limit clock now (cheap haiku ping)\n\n\
-Providers: claude-pro, zai-codeplus, chatgpt-plus, ollama-pro\n"
+  start-window                     Start Claude's 5h limit clock now (cheap haiku ping)\n  \
+  alert                            Push Telegram alerts on level transitions (ok/warning/critical)\n\
+\nProviders: claude-pro, zai-codeplus, chatgpt-plus, ollama-pro\n"
 }
 
 fn default_config_path() -> PathBuf {
@@ -192,6 +194,10 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             }
+        }
+        "alert" => {
+            alert::run(&conn, &cfg);
+            ExitCode::SUCCESS
         }
         other => {
             eprintln!("unknown command: {other}\n");
