@@ -218,9 +218,40 @@ fn extract_note(rest: &[String]) -> Option<String> {
 }
 
 fn run_collect(conn: &rusqlite::Connection, cfg: &config::Config) {
-    let (pct, source, note) = collectors::claude::collect(cfg);
-    if let Err(e) = db::observe(conn, "claude-pro", Some(pct), &source, &note) {
-        eprintln!("db error recording claude-pro: {e}");
+    match collectors::hermes::collect("anthropic") {
+        Ok(snapshot) => {
+            if let Err(e) = db::observe(
+                conn,
+                "claude-pro",
+                Some(snapshot.percent),
+                &snapshot.source,
+                &snapshot.note,
+            ) {
+                eprintln!("db error recording claude-pro: {e}");
+            }
+        }
+        Err(error) => {
+            eprintln!("Hermes Anthropic quota unavailable ({error}); using local fallback");
+            let (pct, source, note) = collectors::claude::collect(cfg);
+            if let Err(e) = db::observe(conn, "claude-pro", Some(pct), &source, &note) {
+                eprintln!("db error recording claude-pro: {e}");
+            }
+        }
+    }
+
+    match collectors::hermes::collect("openai-codex") {
+        Ok(snapshot) => {
+            if let Err(e) = db::observe(
+                conn,
+                "chatgpt-plus",
+                Some(snapshot.percent),
+                &snapshot.source,
+                &snapshot.note,
+            ) {
+                eprintln!("db error recording chatgpt-plus: {e}");
+            }
+        }
+        Err(error) => eprintln!("Hermes ChatGPT quota unavailable: {error}"),
     }
 
     match collectors::zai::collect(cfg) {
