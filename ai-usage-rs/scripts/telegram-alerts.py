@@ -14,12 +14,18 @@ import json
 import os
 import sqlite3
 import sys
+import time
 import urllib.request
 from urllib.parse import urlencode
 
 DB = os.path.expanduser("~/.local/share/ai-usage-optimizer/usage.sqlite3")
 STATE = os.path.expanduser("~/.local/share/ai-usage-optimizer/alert-state.json")
 WARNING, CRITICAL = 90.0, 95.0
+# Minimum seconds between pushes for the same provider — prevents alert flapping.
+COOLDOWN_SECS = 30 * 60
+# AI_USAGE_DRY_RUN=1 prints messages instead of sending them (pipeline testing
+# must never disturb the user; this is the only sanctioned way to verify).
+DRY_RUN = os.environ.get("AI_USAGE_DRY_RUN") == "1"
 
 
 def level_for(pct):
@@ -114,8 +120,17 @@ def main():
     for provider, lvl in sorted(changes.items()):
         pct, source, note = state[provider]
         msg = compose(provider, pct, source, note, lvl, state)
-        if send_telegram(msg):
+        last_push = previous.get(f"__pushed_{provider}", 0)
+        now = time.time()
+        if now - last_push < COOLDOWN_SECS:
+            print(f"cooldown: skipping push for {provider} (last {int(now - last_push)}s ago)")
+            previous[provider] = lvl
+            continue
+        if DRY_RUN:
+            print(f"[dry-run] would push: {msg}")
+        elif send_telegram(msg):
             print(f"pushed: {msg}")
+            previous[f"__pushed_{provider}"] = now
         previous[provider] = lvl
 
     with open(STATE, "w") as f:
