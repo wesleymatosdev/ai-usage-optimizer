@@ -19,6 +19,7 @@ use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::env;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -30,6 +31,39 @@ fn state_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_default()
         .join(".local/share/ai-usage-optimizer/alert-state.json")
+}
+
+/// Ensure the state directory exists with owner-only permissions (0700).
+fn ensure_state_dir(path: &PathBuf) {
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+        if let Ok(meta) = fs::metadata(parent) {
+            if meta.permissions().mode() & 0o077 != 0 {
+                let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+            }
+        }
+    }
+}
+
+/// Write the state file with 0600 permissions and warn if an existing file
+/// is group/other-accessible (CWE-276).
+fn write_state(path: &PathBuf, contents: &str) {
+    ensure_state_dir(path);
+    // If the file already exists, warn about permissive modes before overwriting.
+    if let Ok(meta) = fs::metadata(path) {
+        let mode = meta.permissions().mode();
+        if mode & 0o077 != 0 {
+            eprintln!(
+                "warning: alert state {} is group/other accessible (mode {:o}); recommend chmod 600",
+                path.display(),
+                mode & 0o777
+            );
+        }
+    }
+    if let Ok(file) = fs::File::create(path) {
+        let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
+    }
+    let _ = fs::write(path, contents);
 }
 
 fn level_for(pct: Option<f64>, cfg: &Config) -> &'static str {
@@ -160,9 +194,9 @@ pub fn run(conn: &Connection, cfg: &Config) {
             .iter()
             .map(|(k, v)| (k.clone(), Value::String((*v).to_string())))
             .collect();
-        let _ = fs::write(
+        write_state(
             &path,
-            serde_json::to_string_pretty(&baseline).unwrap_or_default() + "\n",
+            &(serde_json::to_string_pretty(&baseline).unwrap_or_default() + "\n"),
         );
         let keys: Vec<&String> = current.keys().collect();
         println!("baseline recorded: {keys:?}");
@@ -186,9 +220,9 @@ pub fn run(conn: &Connection, cfg: &Config) {
         for (p, lvl) in &current {
             merged.insert(p.clone(), Value::String((*lvl).to_string()));
         }
-        let _ = fs::write(
+        let _ = write_state(
             &path,
-            serde_json::to_string_pretty(&merged).unwrap_or_default() + "\n",
+            &(serde_json::to_string_pretty(&merged).unwrap_or_default() + "\n"),
         );
         return;
     }
@@ -229,8 +263,8 @@ pub fn run(conn: &Connection, cfg: &Config) {
         merged.insert(provider.to_string(), Value::String((*level).to_string()));
     }
 
-    let _ = fs::write(
+    let _ = write_state(
         &path,
-        serde_json::to_string_pretty(&merged).unwrap_or_default() + "\n",
+        &(serde_json::to_string_pretty(&merged).unwrap_or_default() + "\n"),
     );
 }

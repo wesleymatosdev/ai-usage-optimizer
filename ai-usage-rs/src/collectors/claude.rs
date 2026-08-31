@@ -39,7 +39,25 @@ fn home() -> PathBuf {
 }
 
 fn read_cache() -> Option<CacheInfo> {
-    let text = fs::read_to_string(home().join(".claude.json")).ok()?;
+    let cache_path = home().join(".claude.json");
+
+    // CWE-276: refuse to read the OAuth cache if it's world/group-readable —
+    // that means another user could have tampered with it or scraped the
+    // full OAuth session from it.
+    if let Ok(meta) = fs::metadata(&cache_path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode();
+        if mode & 0o077 != 0 {
+            eprintln!(
+                "warning: {} is group/other accessible (mode {:o}); refusing to read OAuth cache — run chmod 600",
+                cache_path.display(),
+                mode & 0o777
+            );
+            return None;
+        }
+    }
+
+    let text = fs::read_to_string(&cache_path).ok()?;
     let v: Value = serde_json::from_str(&text).ok()?;
     let cached = v.get("cachedUsageUtilization")?;
     let util = cached.get("utilization")?;
@@ -107,6 +125,18 @@ fn configured_budget(cfg: &Config) -> u64 {
 /// Uses `DirEntry::file_type()` (does not follow symlinks) rather than
 /// `Path::is_dir()`, so a symlink cycle under root can't cause unbounded recursion.
 fn find_files(root: &PathBuf, suffix: &str, out: &mut Vec<PathBuf>) {
+    find_files_inner(root, suffix, out, 0);
+}
+
+/// Recursively collect files matching `suffix`, with a depth limit to prevent
+/// unbounded traversal (CWE-400). Symlinks are not followed because we use
+/// DirEntry::file_type(), which doesn't resolve symlinks.
+fn find_files_inner(root: &PathBuf, suffix: &str, out: &mut Vec<PathBuf>, depth: u32) {
+    const MAX_DEPTH: u32 = 10;
+    if depth > MAX_DEPTH {
+        eprintln!("warning: max directory depth ({MAX_DEPTH}) reached at {}, skipping", root.display());
+        return;
+    }
     let Ok(entries) = fs::read_dir(root) else {
         return;
     };
@@ -116,7 +146,7 @@ fn find_files(root: &PathBuf, suffix: &str, out: &mut Vec<PathBuf>) {
         };
         let path = entry.path();
         if file_type.is_dir() {
-            find_files(&path, suffix, out);
+            find_files_inner(&path, suffix, out, depth + 1);
         } else if file_type.is_file() && path.to_string_lossy().ends_with(suffix) {
             out.push(path);
         }

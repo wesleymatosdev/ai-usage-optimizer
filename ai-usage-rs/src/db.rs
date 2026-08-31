@@ -1,6 +1,7 @@
 use rusqlite::{params, Connection, OptionalExtension, Result as SqlResult};
 use std::collections::HashMap;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -39,6 +40,29 @@ pub fn now_iso() -> String {
 pub fn open(path: &Path) -> SqlResult<Connection> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).ok();
+        // Restrict the data directory to owner-only (0700), bypassing umask.
+        if let Ok(meta) = fs::metadata(parent) {
+            let perms = meta.permissions();
+            if perms.mode() & 0o077 != 0 {
+                let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+            }
+        }
+    }
+    // Create the database file with restrictive permissions before opening.
+    if !path.exists() {
+        if let Ok(file) = fs::File::create(path) {
+            let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
+        }
+    } else if let Ok(meta) = fs::metadata(path) {
+        // Warn if the existing database is world-readable or group-readable.
+        let mode = meta.permissions().mode();
+        if mode & 0o077 != 0 {
+            eprintln!(
+                "warning: database {} is group/other accessible (mode {:o}); recommend chmod 600",
+                path.display(),
+                mode & 0o777
+            );
+        }
     }
     let conn = Connection::open(path)?;
     conn.execute_batch(
