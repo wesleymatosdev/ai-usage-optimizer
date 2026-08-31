@@ -104,15 +104,20 @@ fn configured_budget(cfg: &Config) -> u64 {
 }
 
 /// Recursively find files matching a suffix under root, without a walkdir dependency.
+/// Uses `DirEntry::file_type()` (does not follow symlinks) rather than
+/// `Path::is_dir()`, so a symlink cycle under root can't cause unbounded recursion.
 fn find_files(root: &PathBuf, suffix: &str, out: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(root) else {
         return;
     };
     for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
         let path = entry.path();
-        if path.is_dir() {
+        if file_type.is_dir() {
             find_files(&path, suffix, out);
-        } else if path.to_string_lossy().ends_with(suffix) {
+        } else if file_type.is_file() && path.to_string_lossy().ends_with(suffix) {
             out.push(path);
         }
     }
@@ -299,16 +304,40 @@ pub fn collect(cfg: &Config) -> (f64, String, String) {
 /// Uses the same OAuth auth Claude Code already has; model is the cheapest
 /// available alias. Returns a human-readable result note.
 pub fn start_window() -> Result<String, String> {
-    let output = std::process::Command::new("claude")
+    // Bare "claude" is resolved via PATH, which a tampered environment could
+    // hijack; CLAUDE_BIN lets a caller pin a verified absolute path instead.
+    let bin = env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
+
+    let mut child = std::process::Command::new(&bin)
         .arg("-p")
         .arg("--model")
         .arg("haiku")
         .arg("Reply with exactly: window-started")
-        .output()
-        .map_err(|e| format!("failed to spawn claude: {e}"))?;
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to spawn {bin}: {e}"))?;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{bin} ping timed out after 30s"));
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Err(e) => return Err(format!("failed to wait on {bin}: {e}")),
+        }
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("failed to collect {bin} output: {e}"))?;
     if !output.status.success() {
         return Err(format!(
-            "claude ping failed ({}): {}",
+            "{bin} ping failed ({}): {}",
             output.status,
             String::from_utf8_lossy(&output.stderr).trim()
         ));

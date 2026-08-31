@@ -123,7 +123,10 @@ fn send_telegram(text: &str) -> bool {
         "chat_id": chat,
         "text": text,
     });
-    match ureq::post(&url).send_json(payload) {
+    match ureq::post(&url)
+        .timeout(std::time::Duration::from_secs(15))
+        .send_json(payload)
+    {
         Ok(r) => r.status() == 200,
         Err(e) => {
             // ureq's Display includes the request URL, which embeds the bot

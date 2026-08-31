@@ -38,9 +38,18 @@ pub fn collect(cfg: &Config) -> Result<Option<(f64, String)>, String> {
         .as_deref()
         .ok_or_else(|| "zai-codeplus endpoint missing from config".to_string())?;
 
+    // The API key is sent to this URL — anchor it to the real host so a
+    // tampered config can't redirect the key to an attacker-controlled server.
+    if !endpoint.starts_with("https://api.z.ai/") {
+        return Err(format!(
+            "zai-codeplus endpoint must be under https://api.z.ai/, got: {endpoint}"
+        ));
+    }
+
     let resp: Value = ureq::get(endpoint)
         .set("Authorization", &key)
         .set("Accept-Language", "en-US,en;q=0.9")
+        .timeout(std::time::Duration::from_secs(15))
         .call()
         .map_err(|e| e.to_string())?
         .into_json()
