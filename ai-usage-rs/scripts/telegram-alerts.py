@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """ai-usage Telegram alerter — pushes only on level TRANSITIONS per provider.
 
-Reads the latest observations from the ai-usage SQLite db, computes each
-provider's alert level (ok / warning 90%+ / critical 95%+), compares with the
-stored previous state, and sends a Telegram message only for changes
-(including recovery). First run is a silent baseline. Token comes from
-TELEGRAM_BOT_TOKEN in the environment (sourced from ~/.hermes/.env by the
-launchd wrapper) — never hardcoded.
+Alert design (Wesley's error-interface rule): a non-happy-path message must
+answer three things —
+  1. what happened (provider, percent, level, and the actual cause),
+  2. what it means for you (dispatches there will fail / work again),
+  3. what to do (switch to the provider with real headroom, or wait).
+Never just a level name. Token comes from TELEGRAM_BOT_TOKEN in the
+environment — never hardcoded.
 """
 
 import json
@@ -31,15 +32,45 @@ def level_for(pct):
     return "ok"
 
 
-def latest_levels():
+def latest_state():
+    """{provider: (percent, source, note)} for the newest observation of each."""
     conn = sqlite3.connect(DB)
     rows = conn.execute(
-        "SELECT o.provider, o.percent FROM observations o "
+        "SELECT o.provider, o.percent, o.source, o.note FROM observations o "
         "JOIN (SELECT provider, MAX(id) AS id FROM observations GROUP BY provider) x "
         "ON o.id = x.id"
     ).fetchall()
     conn.close()
-    return {p: level_for(pct) for p, pct in rows}
+    return {p: (pct, src, note or "") for p, pct, src, note in rows}
+
+
+def action_line(state, exclude):
+    """The 'what to do' half: route to the provider with the most headroom."""
+    candidates = sorted(
+        (pct, p) for p, (pct, _, _) in state.items()
+        if p != exclude and pct is not None and pct < WARNING
+    )
+    if candidates:
+        pct, p = candidates[0]
+        return f"Route work to {p} ({pct:.0f}% used)."
+    return "No provider has verified headroom — use Ollama local models or wait for a window reset."
+
+
+def compose(provider, pct, source, note, level, state):
+    cause = {
+        "limit-hit": f"{provider} just returned a hard limit (429/session cap) — {note or 'no details recorded'}",
+        "manual": f"{provider} observation: {pct:.0f}% used ({note or 'no source noted'})",
+    }.get(source, f"{provider} is at {pct:.0f}% used ({note or source})")
+
+    if level == "ok":
+        impact = "it can take dispatches again."
+        return f"ai-usage: {cause} — {impact}"
+
+    impact = {
+        "critical": "dispatches there will fail outright.",
+        "warning": "dispatches there may start failing soon.",
+    }[level]
+    return f"ai-usage: {cause} — {impact} {action_line(state, provider)}"
 
 
 def send_telegram(text):
@@ -59,7 +90,8 @@ def send_telegram(text):
 
 
 def main():
-    current = latest_levels()
+    state = latest_state()
+    current = {p: level_for(pct) for p, (pct, _, _) in state.items()}
     try:
         with open(STATE) as f:
             previous = json.load(f)
@@ -79,24 +111,9 @@ def main():
         print("no level changes")
         return
 
-    # Pull latest percent + note per provider so pushes are self-explanatory.
-    conn = sqlite3.connect(DB)
-    details = dict(
-        conn.execute(
-            "SELECT o.provider, o.percent || '% — ' || COALESCE(o.note, '') FROM observations o "
-            "JOIN (SELECT provider, MAX(id) AS id FROM observations GROUP BY provider) x "
-            "ON o.id = x.id"
-        ).fetchall()
-    )
-    conn.close()
-
     for provider, lvl in sorted(changes.items()):
-        old = previous.get(provider, "unknown")
-        detail = details.get(provider, "")
-        if lvl == "ok":
-            msg = f"ai-usage: {provider} back under {WARNING:.0f}% (was {old}). Now: {detail}"
-        else:
-            msg = f"ai-usage: {provider} hit {lvl.upper()} threshold (was {old}). Now: {detail}"
+        pct, source, note = state[provider]
+        msg = compose(provider, pct, source, note, lvl, state)
         if send_telegram(msg):
             print(f"pushed: {msg}")
         previous[provider] = lvl
