@@ -4,3 +4,16 @@ __pycache__/
 .venv/
 data/
 .hermes.md
+
+# Lagune
+/.lagune/templates/
+/.lagune/hooks/
+/.lagune/proofs/
+/.lagune/specializations.md
+/.lagune/skills/*
+/**/lagune.*
+/**/lagune/
+
+# Lagune local tool state
+/.lagune/
+ai-usage-rs/.lagune/
