@@ -63,6 +63,11 @@ pub fn open(path: &Path) -> SqlResult<Connection> {
             provider TEXT NOT NULL,
             tokens INTEGER NOT NULL,
             at_unix INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS lanes (
+            id INTEGER PRIMARY KEY,
+            provider TEXT NOT NULL,
+            claimed_at INTEGER NOT NULL
         );",
     )?;
     Ok(conn)

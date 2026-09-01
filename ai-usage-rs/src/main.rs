@@ -13,6 +13,7 @@ mod budget;
 mod collectors;
 mod config;
 mod db;
+mod lanes;
 mod route;
 mod routing;
 
@@ -133,6 +134,7 @@ fn main() -> ExitCode {
                             "note": c.note,
                             "verdict": c.verdict.as_str(),
                             "has_headroom": c.has_headroom,
+                            "reset_in_secs": c.reset_in_secs,
                         })
                     })
                     .collect();
@@ -370,6 +372,52 @@ fn main() -> ExitCode {
                     eprintln!("unknown budget subcommand: {other}");
                     eprintln!("usage: ai-usage budget check <provider> <estimate> | budget record <provider> <tokens> [--at-unix TS]");
                     ExitCode::FAILURE
+                }
+            }
+        }
+        "lane" => {
+            let mut rest = args[2..].iter();
+            let sub = rest.next().map(String::as_str).unwrap_or("");
+            let provider = rest.next().cloned().unwrap_or_default();
+            if !PROVIDERS.contains(&provider.as_str()) {
+                eprintln!("unknown provider: {provider}. Valid: {:?}", PROVIDERS);
+                ExitCode::FAILURE
+            } else {
+                match sub {
+                    "claim" => match lanes::claim(&conn, &cfg, &provider, lanes::now_unix()) {
+                        Ok(active) => {
+                            println!("lane claimed ({active} active)");
+                            ExitCode::SUCCESS
+                        }
+                        Err(e) => {
+                            eprintln!("{e}");
+                            ExitCode::FAILURE
+                        }
+                    },
+                    "release" => match lanes::release(&conn, &provider) {
+                        Ok(removed) => {
+                            println!(
+                                "{}",
+                                if removed {
+                                    "lane released"
+                                } else {
+                                    "no active lane to release"
+                                }
+                            );
+                            ExitCode::SUCCESS
+                        }
+                        Err(e) => {
+                            eprintln!("{e}");
+                            ExitCode::FAILURE
+                        }
+                    },
+                    other => {
+                        eprintln!("unknown lane subcommand: {other}");
+                        eprintln!(
+                            "usage: ai-usage lane claim <provider> | lane release <provider>"
+                        );
+                        ExitCode::FAILURE
+                    }
                 }
             }
         }

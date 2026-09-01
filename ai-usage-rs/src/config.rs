@@ -28,6 +28,9 @@ pub struct ProviderConfig {
     /// Hard rolling-7-day ceiling for this provider's plan.
     #[serde(default)]
     pub weekly_token_budget: Option<u64>,
+    /// Max concurrent worker lanes allowed on this provider (default 1).
+    #[serde(default)]
+    pub max_parallel_lanes: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -55,6 +58,7 @@ fn ollama_local_config() -> ProviderConfig {
         note: Some("Local Ollama models are unmetered.".to_string()),
         daily_token_budget: None,
         weekly_token_budget: None,
+        max_parallel_lanes: None,
     }
 }
 
@@ -73,6 +77,7 @@ impl Config {
                 note: Some("Exact OAuth quota via Hermes when available.".to_string()),
                 daily_token_budget: None,
                 weekly_token_budget: None,
+                max_parallel_lanes: None,
             },
         );
         providers.insert(
@@ -85,6 +90,7 @@ impl Config {
                 note: None,
                 daily_token_budget: None,
                 weekly_token_budget: None,
+                max_parallel_lanes: None,
             },
         );
         providers.insert(
@@ -97,6 +103,7 @@ impl Config {
                 note: Some("Exact Codex quota via Hermes OAuth when available.".to_string()),
                 daily_token_budget: None,
                 weekly_token_budget: None,
+                max_parallel_lanes: None,
             },
         );
         providers.insert(
@@ -111,6 +118,7 @@ impl Config {
                 ),
                 daily_token_budget: None,
                 weekly_token_budget: None,
+                max_parallel_lanes: None,
             },
         );
         providers.insert("ollama-local".to_string(), ollama_local_config());

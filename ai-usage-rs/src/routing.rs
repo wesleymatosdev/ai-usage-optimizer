@@ -17,6 +17,13 @@ use crate::config::Config;
 use crate::db::Observation;
 use std::collections::HashMap;
 
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
     Eligible,
@@ -44,6 +51,8 @@ pub struct VerdictedCandidate {
     pub note: String,
     pub verdict: Verdict,
     pub has_headroom: bool,
+    /// Seconds until the next window reset, parsed from the note when present.
+    pub reset_in_secs: Option<i64>,
 }
 
 /// Classify one provider's latest observation into a routing verdict.
@@ -56,9 +65,11 @@ pub fn classify(cfg: &Config, state: Option<&Observation>, provider: &str) -> Ve
             note: String::new(),
             verdict: Verdict::Unknown,
             has_headroom: false,
+            reset_in_secs: None,
         };
     };
 
+    let reset_in_secs = reset_in_secs_from_note(&state.note, now_unix());
     let base = VerdictedCandidate {
         provider: provider.to_string(),
         percent: state.percent,
@@ -66,6 +77,7 @@ pub fn classify(cfg: &Config, state: Option<&Observation>, provider: &str) -> Ve
         note: state.note.clone(),
         verdict: Verdict::Unknown,
         has_headroom: false,
+        reset_in_secs,
     };
 
     let Some(pct) = state.percent else {
@@ -98,6 +110,43 @@ pub fn classify_all(
         .iter()
         .map(|p| classify(cfg, states.get(p), p))
         .collect()
+}
+
+/// Parse a reset timestamp out of an observation note and return seconds
+/// from `now` until the reset. Understands the shapes the collectors emit:
+///   "(resets 2026-09-01T12:00:00+00:00)"  /  "(resets in 47m)"
+/// Returns None when the note carries no parseable reset.
+pub fn reset_in_secs_from_note(note: &str, now_unix: i64) -> Option<i64> {
+    let idx = note.find("(resets ")?;
+    let rest = &note[idx + "(resets ".len()..];
+    let end = rest.find(')')?;
+    let body = &rest[..end];
+
+    // "resets in 47m" style (relative).
+    if let Some(stripped) = body.strip_prefix("in ") {
+        let digits: String = stripped
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if !digits.is_empty() {
+            let unit = stripped
+                .chars()
+                .skip(digits.len())
+                .find(|c| !c.is_whitespace())?;
+            let n: i64 = digits.parse().ok()?;
+            return Some(match unit {
+                'h' => n * 3600,
+                'm' => n * 60,
+                's' => n,
+                _ => return None,
+            });
+        }
+    }
+
+    // Absolute timestamp — reuse the collectors' ISO parser.
+    let ts = crate::collectors::claude::parse_iso_to_unix(body)?;
+    let delta = (ts as i64) - now_unix;
+    Some(delta.max(0))
 }
 
 #[cfg(test)]
