@@ -10,13 +10,18 @@
 //! - `local-first` — eligible with headroom on raw percentages, but the
 //!   local-first policy suppresses it because the unmetered local runtime is
 //!   comparably fresh: policy-refused, must never be dispatched.
-//! - `exhausted`   — at/above the critical threshold, or a limit-hit was
-//!   recorded: dispatches will fail.
+//! - `backoff`     — a 429/session rate limit was recorded INSIDE the
+//!   provider's TTL window: transient, means "retry shortly". Distinct from
+//!   `exhausted` — the monthly credit pool is untouched by a 429, and the
+//!   verdict self-clears when the TTL expires.
+//! - `exhausted`   — at/above the critical threshold, or a LEGACY sticky
+//!   limit-hit observation still stands: dispatches will fail.
 //! - `unknown`     — never observed: routing must not assume headroom.
 //! - `unavailable` — the collector explicitly reported the quota source as
 //!   unavailable (no percentage exists).
 
 use crate::config::Config;
+use crate::credits;
 use crate::db::Observation;
 use std::collections::HashMap;
 
@@ -38,6 +43,7 @@ fn now_unix() -> i64 {
 pub enum Verdict {
     Eligible,
     LocalFirst,
+    Backoff,
     Exhausted,
     Unknown,
     Unavailable,
@@ -48,6 +54,7 @@ impl Verdict {
         match self {
             Verdict::Eligible => "eligible",
             Verdict::LocalFirst => "local-first",
+            Verdict::Backoff => "backoff",
             Verdict::Exhausted => "exhausted",
             Verdict::Unknown => "unknown",
             Verdict::Unavailable => "unavailable",
@@ -68,7 +75,19 @@ pub struct VerdictedCandidate {
 }
 
 /// Classify one provider's latest observation into a routing verdict.
-pub fn classify(cfg: &Config, state: Option<&Observation>, provider: &str) -> VerdictedCandidate {
+///
+/// `conn` supplies the transient rate-event table: an active backoff verdict
+/// comes from the provider's TTL'd rate_events row, never from the
+/// observation stream, so a 429 can never masquerade as plan exhaustion.
+/// `now` seeds both the backoff TTL check and note-based reset parsing
+/// (tests pass a fixed clock; callers pass the real one).
+pub fn classify(
+    conn: &rusqlite::Connection,
+    cfg: &Config,
+    state: Option<&Observation>,
+    provider: &str,
+    now: i64,
+) -> VerdictedCandidate {
     let Some(state) = state else {
         return VerdictedCandidate {
             provider: provider.to_string(),
@@ -81,7 +100,7 @@ pub fn classify(cfg: &Config, state: Option<&Observation>, provider: &str) -> Ve
         };
     };
 
-    let reset_in_secs = reset_in_secs_from_note(&state.note, now_unix());
+    let reset_in_secs = reset_in_secs_from_note(&state.note, now);
     let base = VerdictedCandidate {
         provider: provider.to_string(),
         percent: state.percent,
@@ -99,7 +118,30 @@ pub fn classify(cfg: &Config, state: Option<&Observation>, provider: &str) -> Ve
         };
     };
 
-    if state.source == "limit-hit" || pct >= cfg.thresholds.critical {
+    // Transient 429/session limit recorded inside the TTL window → `backoff`,
+    // which self-clears. The percent reading (credit pool or manual) stays
+    // visible and untouched — the two signals never merge again.
+    let backoff = credits::backoff_state(conn, cfg, provider, now);
+    if backoff.active && state.source != "limit-hit" {
+        return VerdictedCandidate {
+            verdict: Verdict::Backoff,
+            ..base
+        };
+    }
+
+    // A LEGACY sticky limit-hit observation (pre-credit-model row) still
+    // means hard exhaustion — but only in its unmigrated form. The
+    // migration rewrites old rows to `limit-hit-consumed`, so a stale 100%
+    // observation from a subagent 429 stops poisoning the verdict the
+    // moment the new binary opens the DB. For credit-pool providers the
+    // percent-of-pool replaces any stale percentage entirely.
+    let credit_modeled = cfg
+        .providers
+        .get(provider)
+        .and_then(|p| p.monthly_credit_dollars)
+        .unwrap_or(0.0)
+        > 0.0;
+    if !credit_modeled && (state.source == "limit-hit" || pct >= cfg.thresholds.critical) {
         return VerdictedCandidate {
             verdict: Verdict::Exhausted,
             ..base
@@ -120,9 +162,11 @@ pub fn classify(cfg: &Config, state: Option<&Observation>, provider: &str) -> Ve
 /// is marked `local-first` with `has_headroom: false` — machine consumers
 /// reading `recommend --json` never see a suppressed provider as dispatchable.
 pub fn classify_all(
+    conn: &rusqlite::Connection,
     cfg: &Config,
     states: &HashMap<String, Observation>,
 ) -> Vec<VerdictedCandidate> {
+    let now = now_unix();
     let local_pct = states.get("ollama-local").and_then(|s| s.percent);
     let suppresses = |provider: &str, pct: f64| -> bool {
         if !cfg.local_first || provider == "ollama-local" {
@@ -136,7 +180,7 @@ pub fn classify_all(
     cfg.rotation_order
         .iter()
         .map(|p| {
-            let mut c = classify(cfg, states.get(p), p);
+            let mut c = classify(conn, cfg, states.get(p), p, now);
             if c.verdict == Verdict::Eligible
                 && c.has_headroom
                 && suppresses(p, c.percent.expect("eligible implies percent"))
@@ -189,9 +233,23 @@ pub fn reset_in_secs_from_note(note: &str, now_unix: i64) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
 
     fn cfg() -> Config {
         Config::default_config()
+    }
+
+    /// In-memory DB with the tables classify consults (rate_events etc.).
+    fn mem_db() -> Connection {
+        let conn = Connection::open_in_memory().expect("memory db");
+        conn.execute_batch(
+            "CREATE TABLE rate_events (id INTEGER PRIMARY KEY, provider TEXT NOT NULL,
+             note TEXT NOT NULL, at_unix INTEGER NOT NULL);
+             CREATE TABLE credit_events (id INTEGER PRIMARY KEY, provider TEXT NOT NULL,
+             used_dollars REAL NOT NULL, at_unix INTEGER NOT NULL);",
+        )
+        .expect("schema");
+        conn
     }
 
     fn obs(percent: Option<f64>, source: &str) -> Observation {
@@ -205,7 +263,8 @@ mod tests {
 
     #[test]
     fn missing_observation_is_unknown_and_has_no_headroom() {
-        let c = classify(&cfg(), None, "claude-pro");
+        let conn = mem_db();
+        let c = classify(&conn, &cfg(), None, "claude-pro", 1_000);
         assert_eq!(c.verdict, Verdict::Unknown);
         assert!(!c.has_headroom);
         assert_eq!(c.percent, None);
@@ -213,45 +272,137 @@ mod tests {
 
     #[test]
     fn unavailable_observation_stays_unavailable_not_zero_usage() {
-        let c = classify(&cfg(), Some(&obs(None, "unavailable")), "zai-codeplus");
+        let conn = mem_db();
+        let c = classify(
+            &conn,
+            &cfg(),
+            Some(&obs(None, "unavailable")),
+            "zai-codeplus",
+            1,
+        );
         assert_eq!(c.verdict, Verdict::Unavailable);
         assert!(!c.has_headroom);
     }
 
     #[test]
     fn critical_reading_is_exhausted() {
-        let c = classify(&cfg(), Some(&obs(Some(96.0), "direct-api")), "zai-codeplus");
+        let conn = mem_db();
+        let c = classify(
+            &conn,
+            &cfg(),
+            Some(&obs(Some(96.0), "direct-api")),
+            "zai-codeplus",
+            1,
+        );
         assert_eq!(c.verdict, Verdict::Exhausted);
         assert!(!c.has_headroom);
     }
 
     #[test]
     fn limit_hit_source_is_exhausted_even_below_critical() {
-        let c = classify(&cfg(), Some(&obs(Some(10.0), "limit-hit")), "ollama-pro");
+        let conn = mem_db();
+        let mut cfg = cfg();
+        // claude-pro is NOT credit-modeled: a legacy sticky limit-hit
+        // observation still means hard exhaustion there.
+        if let Some(p) = cfg.providers.get_mut("claude-pro") {
+            p.monthly_credit_dollars = None;
+        }
+        let c = classify(
+            &conn,
+            &cfg,
+            Some(&obs(Some(10.0), "limit-hit")),
+            "claude-pro",
+            1,
+        );
         assert_eq!(c.verdict, Verdict::Exhausted);
     }
 
     #[test]
+    fn credit_pool_provider_ignores_stale_percent_observations() {
+        let conn = mem_db();
+        let cfg = cfg(); // ollama-pro is credit-modeled ($60 pool)
+        let c = classify(
+            &conn,
+            &cfg,
+            Some(&obs(Some(100.0), "limit-hit-consumed")),
+            "ollama-pro",
+            1_000,
+        );
+        assert_ne!(
+            c.verdict,
+            Verdict::Exhausted,
+            "a stale 100% row must not pin a credit provider"
+        );
+    }
+
+    #[test]
+    fn active_rate_event_is_backoff_not_exhausted() {
+        let conn = mem_db();
+        let cfg = cfg();
+        credits::record_rate_event(&conn, "ollama-pro", "429 session limit", 900).unwrap();
+        let c = classify(
+            &conn,
+            &cfg,
+            Some(&obs(Some(8.4), "manual")),
+            "ollama-pro",
+            1_000,
+        );
+        assert_eq!(c.verdict, Verdict::Backoff);
+        assert_eq!(c.percent, Some(8.4), "the real reading stays visible");
+    }
+
+    #[test]
+    fn expired_rate_event_returns_to_eligible() {
+        let conn = mem_db();
+        let cfg = cfg();
+        credits::record_rate_event(&conn, "ollama-pro", "429", 0).unwrap();
+        let c = classify(
+            &conn,
+            &cfg,
+            Some(&obs(Some(20.0), "manual")),
+            "ollama-pro",
+            credits::DEFAULT_BACKOFF_SECS,
+        );
+        assert_eq!(c.verdict, Verdict::Eligible);
+        assert!(c.has_headroom);
+    }
+
+    #[test]
     fn healthy_reading_is_eligible_with_headroom() {
-        let c = classify(&cfg(), Some(&obs(Some(30.0), "manual")), "chatgpt-plus");
+        let conn = mem_db();
+        let c = classify(
+            &conn,
+            &cfg(),
+            Some(&obs(Some(30.0), "manual")),
+            "chatgpt-plus",
+            1,
+        );
         assert_eq!(c.verdict, Verdict::Eligible);
         assert!(c.has_headroom);
     }
 
     #[test]
     fn warning_level_reading_is_eligible_but_has_no_headroom() {
-        let c = classify(&cfg(), Some(&obs(Some(91.0), "manual")), "chatgpt-plus");
+        let conn = mem_db();
+        let c = classify(
+            &conn,
+            &cfg(),
+            Some(&obs(Some(91.0), "manual")),
+            "chatgpt-plus",
+            1,
+        );
         assert_eq!(c.verdict, Verdict::Eligible);
         assert!(!c.has_headroom);
     }
 
     #[test]
     fn classify_all_marks_local_first_suppressed_eligible_providers() {
+        let conn = mem_db();
         let mut states = HashMap::new();
         states.insert("ollama-local".to_string(), obs(Some(40.0), "manual"));
         states.insert("claude-pro".to_string(), obs(Some(20.0), "manual"));
 
-        let out = classify_all(&cfg(), &states);
+        let out = classify_all(&conn, &cfg(), &states);
         let claude = out.iter().find(|c| c.provider == "claude-pro").unwrap();
         // 20 + 25 = 45 > 40 → the local-first policy suppresses claude-pro
         // even though it is eligible with headroom on raw percentages.
@@ -265,11 +416,12 @@ mod tests {
 
     #[test]
     fn local_first_suppression_requires_a_local_reading_and_respects_toggle() {
+        let conn = mem_db();
         let mut states = HashMap::new();
         states.insert("claude-pro".to_string(), obs(Some(20.0), "manual"));
 
         // No ollama-local reading → policy cannot fire.
-        let out = classify_all(&cfg(), &states);
+        let out = classify_all(&conn, &cfg(), &states);
         assert_eq!(out[0].verdict, Verdict::Eligible);
         assert!(out[0].has_headroom);
 
@@ -278,17 +430,18 @@ mod tests {
         cfg.local_first = false;
         let mut with_local = states.clone();
         with_local.insert("ollama-local".to_string(), obs(Some(40.0), "manual"));
-        let out = classify_all(&cfg, &with_local);
+        let out = classify_all(&conn, &cfg, &with_local);
         assert_eq!(out[0].verdict, Verdict::Eligible);
         assert!(out[0].has_headroom);
     }
 
     #[test]
     fn classify_all_preserves_rotation_order() {
+        let conn = mem_db();
         let mut states = HashMap::new();
         states.insert("claude-pro".to_string(), obs(Some(10.0), "manual"));
         states.insert("chatgpt-plus".to_string(), obs(Some(20.0), "manual"));
-        let out = classify_all(&cfg(), &states);
+        let out = classify_all(&conn, &cfg(), &states);
         assert_eq!(
             out.iter().map(|c| c.provider.as_str()).collect::<Vec<_>>(),
             vec![
@@ -305,7 +458,8 @@ mod tests {
 
     #[test]
     fn classify_all_covers_providers_missing_from_the_state_map() {
-        let out = classify_all(&cfg(), &HashMap::new());
+        let conn = mem_db();
+        let out = classify_all(&conn, &cfg(), &HashMap::new());
         assert!(out.iter().all(|c| c.verdict == Verdict::Unknown));
         assert_eq!(out.len(), 5);
     }

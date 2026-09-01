@@ -244,4 +244,70 @@ pub fn run(conn: &Connection, cfg: &Config) {
         &path,
         serde_json::to_string_pretty(&merged).unwrap_or_default() + "\n",
     );
+
+    // Burn-rate awareness (Part B): a cumulative-percent reading hides
+    // velocity. Check every credit-pool provider's projection and push when
+    // the projected month-end first crosses the pool — transition-gated via
+    // credit_alerts, so a sustained overrun does not spam.
+    check_burn_alerts(conn, cfg, dry_run);
+}
+
+/// Push a Telegram warning when a credit provider's burn projection first
+/// overruns its monthly pool (or when the projection changes materially).
+/// Fires at most once per state (kind = "burn-overrun"), with its own
+/// cooldown column so repeated `alert` runs never flap.
+fn check_burn_alerts(conn: &Connection, cfg: &Config, dry_run: bool) {
+    let now = crate::budget::now_unix();
+    for provider in crate::PROVIDERS {
+        let configured = cfg
+            .providers
+            .get(provider)
+            .and_then(|p| p.monthly_credit_dollars)
+            .unwrap_or(0.0);
+        if configured <= 0.0 {
+            continue;
+        }
+        let state = crate::credits::credit_state(conn, cfg, provider, now);
+        let Some(burn) = &state.burn else { continue };
+        let over = burn.projected_overrun > 0.0;
+        let last: Option<i64> = conn
+            .query_row(
+                "SELECT fired_at FROM credit_alerts
+                 WHERE provider = ?1 AND kind = 'burn-overrun'
+                 ORDER BY id DESC LIMIT 1",
+                rusqlite::params![provider],
+                |row| row.get(0),
+            )
+            .ok();
+        if over && last.is_none() {
+            let message = format!(
+                "ai-usage: {} burn rate ${:.2}/h projects ${:.2} by reset — \
+                 ${:.2} PAST the ${:.2} monthly pool. Impact: the plan exhausts before \
+                 its reset and paid dispatches start failing. Action: move heavy loops to \
+                 subscription-seat or local routes now.",
+                provider,
+                burn.dollars_per_hour,
+                burn.projected_at_reset,
+                burn.projected_overrun,
+                state.pool_dollars
+            );
+            if dry_run {
+                println!("[dry-run] would push: {message}");
+            } else if send_telegram(&message) {
+                println!("pushed: {message}");
+            }
+            let _ = conn.execute(
+                "INSERT INTO credit_alerts (provider, kind, message, fired_at) \
+                 VALUES (?1, 'burn-overrun', ?2, ?3)",
+                rusqlite::params![provider, message, now],
+            );
+        } else if !over && last.is_some() {
+            // Projection returned inside the pool → clear the latch so a
+            // future overrun can fire again.
+            let _ = conn.execute(
+                "DELETE FROM credit_alerts WHERE provider = ?1 AND kind = 'burn-overrun'",
+                rusqlite::params![provider],
+            );
+        }
+    }
 }

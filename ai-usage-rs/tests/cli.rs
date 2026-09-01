@@ -93,7 +93,7 @@ fn observe_and_recommend_round_trip_reports_verified_headroom() {
 }
 
 #[test]
-fn limit_hit_marks_provider_and_recommendation_routes_around_it() {
+fn limit_hit_backs_off_transiently_then_clears_while_consumption_stays_put() {
     let (_s, cfg, db) = sandbox_paths("limithit");
 
     run(&["status"], &cfg, &db);
@@ -106,24 +106,59 @@ fn limit_hit_marks_provider_and_recommendation_routes_around_it() {
     let parsed = recommend_json(&cfg, &db);
     assert_eq!(parsed["recommended"], "claude-pro");
 
-    let (code, _, _) = run(
+    // A 429 becomes a TRANSIENT backoff — routing avoids the provider while
+    // the TTL is live.
+    let (code, stdout, _) = run(
         &["limit-hit", "claude-pro", "--note", "cli test 429"],
         &cfg,
         &db,
     );
     assert_eq!(code, 0);
+    assert!(
+        stdout.contains("transient backoff"),
+        "limit-hit records a transient backoff: {stdout}"
+    );
 
     let parsed = recommend_json(&cfg, &db);
     assert_eq!(parsed["recommended"], serde_json::Value::Null);
 
+    // Backoff must EXPIRE: the same event no longer sticks after its TTL.
+    // Rewind the rate event 16 minutes (past the 15m default TTL) — the
+    // provider is eligible again with its real (20%) reading.
+    let secs = std::process::Command::new("sqlite3")
+        .arg(&db)
+        .arg("SELECT at_unix FROM rate_events ORDER BY id DESC LIMIT 1")
+        .output()
+        .expect("sqlite3 available for test backdating");
+    let at: i64 = String::from_utf8_lossy(&secs.stdout)
+        .trim()
+        .parse()
+        .expect("rate_events.at_unix is an integer");
+    let rewound = at - 16 * 60;
+    std::process::Command::new("sqlite3")
+        .arg(&db)
+        .arg(format!(
+            "UPDATE rate_events SET at_unix = {rewound} WHERE at_unix = {at}"
+        ))
+        .output()
+        .expect("sqlite3 present");
+
+    let parsed = recommend_json(&cfg, &db);
+    assert_eq!(
+        parsed["recommended"], "claude-pro",
+        "expired backoff must not suppress an eligible provider"
+    );
+
+    // The 429 never touched the provider's usage observations: the latest
+    // reading is still the manual 20%, and no 100% row was written.
     let status = run(&["status"], &cfg, &db).1;
     assert!(
         status.contains("claude-pro"),
         "status lists claude-pro: {status}"
     );
     assert!(
-        status.contains("limit-hit"),
-        "status shows source: {status}"
+        !status.contains("100.0%"),
+        "a transient 429 must never render as plan exhaustion: {status}"
     );
 }
 

@@ -10,8 +10,10 @@
 
 mod alert;
 mod budget;
+mod burn;
 mod collectors;
 mod config;
+mod credits;
 mod db;
 mod lanes;
 mod route;
@@ -42,7 +44,9 @@ Commands:\n  \
   start-window                      Start Claude's 5h limit clock now (cheap haiku ping)\n  \
   alert                             Push Telegram alerts on level transitions (ok/warning/critical)\n  \
   budget check <provider> <estimate>          Refuse dispatches that would cross hard daily/weekly ceilings\n  \
-  budget record <provider> <tokens> [--at-unix TS]   Record actual tokens a dispatch consumed\n\
+  budget record <provider> <tokens> [--at-unix TS]   Record actual tokens a dispatch consumed\\n  \\
+  credit record <provider> <dollars-used> [--at-unix TS]   Record a cumulative credit reading\\n  \\
+  credit status <provider>                    Show dollars used/remaining, burn rate, projection\\n\
 \nProviders: claude-pro, zai-codeplus, chatgpt-plus, ollama-pro, ollama-local\n\nNote: --note TEXT is visible via `ps` and shell history. Do not include\nsecrets, tokens, or sensitive context in note arguments.\n"
 }
 
@@ -119,7 +123,7 @@ fn main() -> ExitCode {
         "recommend" => {
             let json_mode = args[2..].iter().any(|a| a == "--json");
             let states = db::latest(&conn);
-            let rec = recommendation(&cfg, &states);
+            let rec = recommendation(&conn, &cfg, &states);
             if json_mode {
                 // Explicit verdicts for EVERY rotation-order provider — the
                 // silent filter_map that dropped unknown providers is what
@@ -128,7 +132,7 @@ fn main() -> ExitCode {
                 // policy-refused provider carries the `local-first` verdict
                 // in `candidates` AND the `excluded` map — a machine consumer
                 // never sees a suppressed provider as dispatchable.
-                let classified = routing::classify_all(&cfg, &states);
+                let classified = routing::classify_all(&conn, &cfg, &states);
                 let candidates: Vec<serde_json::Value> = classified
                     .iter()
                     .map(|c| {
@@ -261,12 +265,88 @@ fn main() -> ExitCode {
             }
             let note = extract_note(&args[3..])
                 .unwrap_or_else(|| "provider reported limit/rate exhaustion".to_string());
-            if let Err(e) = db::observe(&conn, provider, Some(100.0), "limit-hit", &note) {
+            // A 429/session limit is TRANSIENT: record a timestamped rate
+            // event (TTL backoff, default 15m) — never a percent=100
+            // observation. The old sticky behavior rendered one subagent 429
+            // as plan exhaustion and corrupted every routing decision that
+            // read it. Monthly consumption lives in credit_events and is
+            // untouched here.
+            if let Err(e) = credits::record_rate_event(&conn, provider, &note, budget::now_unix()) {
                 eprintln!("db error: {e}");
                 return ExitCode::FAILURE;
             }
-            println!("recorded");
+            let state = credits::backoff_state(&conn, &cfg, provider, budget::now_unix());
+            println!(
+                "recorded: transient backoff on {provider} for {}s (clears in {}s) — \
+                 monthly consumption untouched",
+                state.ttl_secs, state.clear_in_secs
+            );
             ExitCode::SUCCESS
+        }
+        "credit" => {
+            let mut rest = args[2..].iter();
+            let sub = rest.next().map(String::as_str).unwrap_or("");
+            match sub {
+                "record" => {
+                    // usage: credit record <provider> <dollars-used> [--at-unix TS]
+                    let provider = match rest.next() {
+                        Some(p) => p.clone(),
+                        None => {
+                            eprintln!(
+                                "usage: ai-usage credit record <provider> <dollars-used> [--at-unix TS]"
+                            );
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                    if !PROVIDERS.contains(&provider.as_str()) {
+                        eprintln!("unknown provider: {provider}. Valid: {:?}", PROVIDERS);
+                        return ExitCode::FAILURE;
+                    }
+                    let dollars: f64 = match rest.next().and_then(|t| t.parse().ok()) {
+                        Some(d) if d >= 0.0 => d,
+                        _ => {
+                            eprintln!("dollars-used must be a non-negative number (cumulative, from the provider dashboard)");
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                    let at_unix = rest
+                        .next()
+                        .zip(rest.next())
+                        .and_then(|(flag, val)| {
+                            (flag == "--at-unix")
+                                .then_some(())
+                                .and_then(|_| val.parse().ok())
+                        })
+                        .unwrap_or_else(budget::now_unix);
+                    if let Err(e) = credits::record_credit(&conn, &provider, dollars, at_unix) {
+                        eprintln!("db error: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                    println!("recorded ${dollars:.2} cumulative for {provider}");
+                    ExitCode::SUCCESS
+                }
+                "status" => {
+                    let provider = match rest.next() {
+                        Some(p) => p.clone(),
+                        None => {
+                            eprintln!("usage: ai-usage credit status <provider>");
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                    if !PROVIDERS.contains(&provider.as_str()) {
+                        eprintln!("unknown provider: {provider}. Valid: {:?}", PROVIDERS);
+                        return ExitCode::FAILURE;
+                    }
+                    let state = credits::credit_state(&conn, &cfg, &provider, budget::now_unix());
+                    print_credit_state(&state);
+                    ExitCode::SUCCESS
+                }
+                other => {
+                    eprintln!("unknown credit subcommand: {other}");
+                    eprintln!("usage: ai-usage credit record <provider> <dollars-used> [--at-unix TS] | credit status <provider>");
+                    ExitCode::FAILURE
+                }
+            }
         }
         "start-window" => {
             // Start Claude's 5h clock NOW with a cheap haiku ping, then observe
@@ -333,11 +413,15 @@ fn main() -> ExitCode {
                     ExitCode::SUCCESS
                 }
                 "check" => {
-                    // usage: budget check <provider> [estimate_tokens]
+                    // usage: budget check <provider> [estimate]
+                    // Token estimates gate the token ledger; credit-pool
+                    // providers (monthly_credit_dollars configured) are
+                    // gated in DOLLARS: a dispatch whose estimated cost
+                    // would cross the pool is refused, not reported.
                     let provider = match rest.next() {
                         Some(p) => p.clone(),
                         None => {
-                            eprintln!("usage: ai-usage budget check <provider> [estimate_tokens]");
+                            eprintln!("usage: ai-usage budget check <provider> [estimate]");
                             return ExitCode::FAILURE;
                         }
                     };
@@ -358,18 +442,42 @@ fn main() -> ExitCode {
                     let Some(estimate) = estimate else {
                         eprintln!(
                             "refused: no cost estimate — every dispatch must declare its \
-                             estimated tokens before running (budget check <provider> <tokens>)"
+                             estimated cost before running (budget check <provider> <tokens|dollars>)"
                         );
                         return ExitCode::FAILURE;
                     };
-                    let decision =
-                        budget::check(&conn, &cfg, &provider, estimate, budget::now_unix());
-                    if decision.allowed {
-                        println!("{}", decision.message);
-                        ExitCode::SUCCESS
+                    // Credit-pool providers take the estimate as DOLLARS
+                    // (their ceiling is a dollar pool, not tokens).
+                    let now = budget::now_unix();
+                    if credit_configured(&cfg, &provider) {
+                        let estimated_dollars = estimate as f64 / 100.0;
+                        match burn::check_credits(&conn, &cfg, &provider, estimated_dollars, now) {
+                            Ok(decision) => {
+                                if let Some(warning) = &decision.soft_cap_warning {
+                                    eprintln!("warning: {warning}");
+                                }
+                                if decision.allowed {
+                                    println!("{}", decision.message);
+                                    ExitCode::SUCCESS
+                                } else {
+                                    eprintln!("REFUSED: {}", decision.message);
+                                    ExitCode::FAILURE
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("refused: {e}");
+                                ExitCode::FAILURE
+                            }
+                        }
                     } else {
-                        eprintln!("{}", decision.message);
-                        ExitCode::FAILURE
+                        let decision = budget::check(&conn, &cfg, &provider, estimate, now);
+                        if decision.allowed {
+                            println!("{}", decision.message);
+                            ExitCode::SUCCESS
+                        } else {
+                            eprintln!("{}", decision.message);
+                            ExitCode::FAILURE
+                        }
                     }
                 }
                 other => {
@@ -486,6 +594,35 @@ fn run_collect(conn: &rusqlite::Connection, cfg: &config::Config) {
         }
     }
 
+    // Credit-pool providers: mirror the credit percent-of-pool into the
+    // observation stream so route/route-hint consumers see the REAL balance
+    // (10.2%), never a stale limit-hit 100%. No network probe — the figure
+    // comes from recorded credit readings only.
+    for provider in crate::PROVIDERS {
+        let pool = cfg
+            .providers
+            .get(provider)
+            .and_then(|p| p.monthly_credit_dollars)
+            .unwrap_or(0.0);
+        if pool <= 0.0 {
+            continue;
+        }
+        let now = budget::now_unix();
+        let state = credits::credit_state(conn, cfg, provider, now);
+        if let (Some(used), Some(pct)) = (state.used_dollars, state.percent) {
+            let note = format!(
+                "credit pool ${:.2}: ${:.2} used, ${:.2} left, resets {}",
+                state.pool_dollars,
+                used,
+                state.remaining_dollars,
+                crate::db::unix_to_iso(state.reset_at_unix)
+            );
+            if let Err(e) = db::observe(conn, provider, Some(pct), "credit-pool", &note) {
+                eprintln!("db error recording {provider} credit state: {e}");
+            }
+        }
+    }
+
     match collectors::hermes::collect("anthropic") {
         Ok(snapshot) => {
             if let Err(e) = db::observe(
@@ -560,6 +697,12 @@ fn run_collect(conn: &rusqlite::Connection, cfg: &config::Config) {
 fn print_status(conn: &rusqlite::Connection, cfg: &config::Config) {
     let states = db::latest(conn);
     for provider in PROVIDERS {
+        // Credit-pool providers report dollars + percent-of-pool, not the
+        // last observation's percent (a 429 note must never read as 100%).
+        if credit_configured(cfg, provider) {
+            print_credit_line(conn, cfg, provider);
+            continue;
+        }
         match states.get(provider) {
             Some(s) => {
                 let pct = s
@@ -571,9 +714,80 @@ fn print_status(conn: &rusqlite::Connection, cfg: &config::Config) {
             None => println!("{provider:14} unknown — no observation"),
         }
     }
-    let rec = recommendation(cfg, &states);
+    let rec = recommendation(conn, cfg, &states);
     println!("{}", rec.text);
     fire_alerts(conn, cfg, &states, &rec.text);
+}
+
+/// A provider is credit-modeled when its config declares a monthly pool.
+fn credit_configured(cfg: &config::Config, provider: &str) -> bool {
+    cfg.providers
+        .get(provider)
+        .and_then(|p| p.monthly_credit_dollars)
+        .unwrap_or(0.0)
+        > 0.0
+}
+
+/// One status line for a credit-modeled provider: dollars, percent of pool,
+/// burn rate, projected month-end — plus the transient backoff when active.
+fn print_credit_line(conn: &rusqlite::Connection, cfg: &config::Config, provider: &str) {
+    let now = budget::now_unix();
+    let state = credits::credit_state(conn, cfg, provider, now);
+    let backoff = credits::backoff_state(conn, cfg, provider, now);
+    if state.used_dollars.is_none() {
+        println!(
+            "{provider:14}  unset  credits — no dashboard reading yet \
+             (record one: ai-usage credit record {provider} <dollars-used>)"
+        );
+        if backoff.active {
+            println!(
+                "{provider:14}  [BACKOFF {}s: {}]",
+                backoff.clear_in_secs, backoff.note
+            );
+        }
+        return;
+    }
+    let used = state.used_dollars.unwrap_or(0.0);
+    let mut line = format!(
+        "{provider:14} {:5.1}%  credits ${used:.2} of ${:.2} pool (${:.2} left)",
+        state.percent.unwrap_or(0.0),
+        state.pool_dollars,
+        state.remaining_dollars
+    );
+    if let Some(burn) = &state.burn {
+        line.push_str(&format!(
+            " — burn ${:.2}/h, projects ${:.2} by reset (+${:.2} over)",
+            burn.dollars_per_hour, burn.projected_at_reset, burn.projected_overrun
+        ));
+    }
+    if backoff.active {
+        line.push_str(&format!(
+            "  [BACKOFF {}s: {}]",
+            backoff.clear_in_secs, backoff.note
+        ));
+    }
+    println!("{line}");
+}
+
+fn print_credit_state(state: &credits::CreditState) {
+    println!(
+        "{}: ${:.2} of ${:.2} used ({:.1}%), ${:.2} remaining",
+        state.provider,
+        state.used_dollars.unwrap_or(0.0),
+        state.pool_dollars,
+        state.percent.unwrap_or(0.0),
+        state.remaining_dollars
+    );
+    match &state.burn {
+        Some(burn) => println!(
+            "burn rate ${:.2}/h over the last {:.1}h — projected ${:.2} by reset (+${:.2} past the pool)",
+            burn.dollars_per_hour,
+            burn.window_secs as f64 / 3600.0,
+            burn.projected_at_reset,
+            burn.projected_overrun
+        ),
+        None => println!("burn rate: need at least two credit readings"),
+    }
 }
 
 /// A routing recommendation: which provider to send the next task to.
@@ -584,6 +798,7 @@ struct Recommendation {
 }
 
 fn recommendation(
+    conn: &rusqlite::Connection,
     cfg: &config::Config,
     states: &std::collections::HashMap<String, db::Observation>,
 ) -> Recommendation {
@@ -592,7 +807,7 @@ fn recommendation(
     // policy is applied inside classify_all (single source of truth), so a
     // provider the policy refuses carries the `local-first` verdict there
     // and can never be recommended here.
-    let classified = routing::classify_all(cfg, states);
+    let classified = routing::classify_all(conn, cfg, states);
     let mut candidates: Vec<(f64, &str)> = classified
         .iter()
         .filter(|c| c.verdict == routing::Verdict::Eligible && c.has_headroom)

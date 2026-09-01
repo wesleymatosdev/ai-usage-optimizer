@@ -91,6 +91,10 @@ mod tests {
                 daily_token_budget: None,
                 weekly_token_budget: None,
                 max_parallel_lanes: Some(n),
+                monthly_credit_dollars: None,
+                credit_reset_at: None,
+                rate_limit_backoff_secs: None,
+                daily_credit_soft_cap: None,
             },
         );
         Config {

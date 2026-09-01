@@ -31,6 +31,23 @@ pub struct ProviderConfig {
     /// Max concurrent worker lanes allowed on this provider (default 1).
     #[serde(default)]
     pub max_parallel_lanes: Option<u32>,
+    /// Monthly prepaid credit pool in dollars (e.g. Ollama Pro's $60/month).
+    /// Percent-of-pool replaces percent-of-rate-limit for these providers;
+    /// the balance figure is only ever moved by real `credit` readings.
+    #[serde(default)]
+    pub monthly_credit_dollars: Option<f64>,
+    /// ISO 8601 timestamp of the credit period's reset. Absent = the period
+    /// ends 21 days after the provider's first recorded reading.
+    #[serde(default)]
+    pub credit_reset_at: Option<String>,
+    /// How long a 429/session rate-limit backoff lasts, in seconds
+    /// (default 900). Transient by design — never a permanent flag.
+    #[serde(default)]
+    pub rate_limit_backoff_secs: Option<i64>,
+    /// Daily dollar soft cap: crossing it warns (Telegram) but does not
+    /// refuse; the monthly pool ceiling is what refuses.
+    #[serde(default)]
+    pub daily_credit_soft_cap: Option<f64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -59,6 +76,10 @@ fn ollama_local_config() -> ProviderConfig {
         daily_token_budget: None,
         weekly_token_budget: None,
         max_parallel_lanes: None,
+        monthly_credit_dollars: None,
+        credit_reset_at: None,
+        rate_limit_backoff_secs: None,
+        daily_credit_soft_cap: None,
     }
 }
 
@@ -78,6 +99,10 @@ impl Config {
                 daily_token_budget: None,
                 weekly_token_budget: None,
                 max_parallel_lanes: None,
+                monthly_credit_dollars: None,
+                credit_reset_at: None,
+                rate_limit_backoff_secs: None,
+                daily_credit_soft_cap: None,
             },
         );
         providers.insert(
@@ -91,6 +116,10 @@ impl Config {
                 daily_token_budget: None,
                 weekly_token_budget: None,
                 max_parallel_lanes: None,
+                monthly_credit_dollars: None,
+                credit_reset_at: None,
+                rate_limit_backoff_secs: None,
+                daily_credit_soft_cap: None,
             },
         );
         providers.insert(
@@ -104,6 +133,10 @@ impl Config {
                 daily_token_budget: None,
                 weekly_token_budget: None,
                 max_parallel_lanes: None,
+                monthly_credit_dollars: None,
+                credit_reset_at: None,
+                rate_limit_backoff_secs: None,
+                daily_credit_soft_cap: None,
             },
         );
         providers.insert(
@@ -119,6 +152,10 @@ impl Config {
                 daily_token_budget: None,
                 weekly_token_budget: None,
                 max_parallel_lanes: None,
+                monthly_credit_dollars: Some(60.0),
+                credit_reset_at: None,
+                rate_limit_backoff_secs: None,
+                daily_credit_soft_cap: Some(8.0),
             },
         );
         providers.insert("ollama-local".to_string(), ollama_local_config());

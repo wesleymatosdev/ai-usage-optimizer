@@ -14,11 +14,19 @@ pub struct Observation {
 }
 
 pub fn now_iso() -> String {
-    let dur = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    // Minimal RFC3339-ish UTC timestamp, no external chrono dependency.
-    let secs = dur.as_secs();
+    unix_to_iso(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0),
+    )
+}
+
+/// RFC3339-ish UTC timestamp from unix seconds (no external chrono dep;
+/// civil_from_days, Howard Hinnant). Inverse of the ISO parser in
+/// collectors::claude.
+pub fn unix_to_iso(unix: i64) -> String {
+    let secs = unix.max(0) as u64;
     let days = secs / 86400;
     let rem = secs % 86400;
     let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
@@ -37,6 +45,13 @@ pub fn now_iso() -> String {
 }
 
 pub fn open(path: &Path) -> SqlResult<Connection> {
+    open_conn(path)
+}
+
+/// Open the connection, create tables, then run the sticky limit-hit
+/// migration. `open` delegates here so the prepare-failure early-return
+/// path (E0505 borrow) can still hand back a usable connection.
+fn open_conn(path: &Path) -> SqlResult<Connection> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).ok();
     }
@@ -68,8 +83,83 @@ pub fn open(path: &Path) -> SqlResult<Connection> {
             id INTEGER PRIMARY KEY,
             provider TEXT NOT NULL,
             claimed_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS rate_events (
+            id INTEGER PRIMARY KEY,
+            provider TEXT NOT NULL,
+            note TEXT NOT NULL,
+            at_unix INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS credit_events (
+            id INTEGER PRIMARY KEY,
+            provider TEXT NOT NULL,
+            used_dollars REAL NOT NULL,
+            at_unix INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS credit_alerts (
+            id INTEGER PRIMARY KEY,
+            provider TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            message TEXT NOT NULL,
+            fired_at INTEGER NOT NULL
         );",
     )?;
+    // Migration: pre-credit-model `limit-hit` observations wrote percent=100
+    // with source='limit-hit' and stuck forever (the sticky bug). Move any
+    // that predate this migration into rate_events (timestamped, expiring
+    // under the default TTL) and stop them being the provider's latest
+    // reading, so routing sees the real balance again.
+    let sticky: Vec<(String, String, i64)> = {
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT provider, COALESCE(note, ''), observed_at FROM observations
+             WHERE source = 'limit-hit'",
+        ) else {
+            return open_conn(path);
+        };
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        });
+        match rows {
+            Ok(rows) => rows
+                .flatten()
+                .filter_map(|(p, n, at)| {
+                    crate::collectors::claude::parse_iso_to_unix(&at).map(|ts| (p, n, ts as i64))
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    };
+    for (provider, note, at_unix) in sticky {
+        let already: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM rate_events WHERE provider = ?1 AND at_unix = ?2 LIMIT 1",
+                params![provider, at_unix],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap_or(None);
+        if already.is_none() {
+            conn.execute(
+                "INSERT INTO rate_events (provider, note, at_unix) VALUES (?1, ?2, ?3)",
+                params![
+                    provider,
+                    format!("migrated from sticky observation: {note}"),
+                    at_unix
+                ],
+            )?;
+        }
+        // Keep the historical row for audit, but mark it consumed so `latest`
+        // no longer treats it as a live reading.
+        conn.execute(
+            "UPDATE observations SET source = 'limit-hit-consumed'
+             WHERE source = 'limit-hit' AND provider = ?1",
+            params![provider],
+        )?;
+    }
     Ok(conn)
 }
 
