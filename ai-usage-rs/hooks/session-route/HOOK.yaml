@@ -1,0 +1,8 @@
+name: session-route
+description: >
+  Logs the ai-usage routing recommendation at session start so no session
+  opens on a stale route. Read-only — never mutates ~/.hermes config or
+  runtime state. Deploy by copying this directory to ~/.hermes/hooks/session-route/
+  and restarting the gateway (hooks do not hot-reload).
+events:
+  - session:start

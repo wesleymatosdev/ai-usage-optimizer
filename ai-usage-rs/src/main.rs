@@ -12,6 +12,7 @@ mod alert;
 mod collectors;
 mod config;
 mod db;
+mod route;
 
 use std::env;
 use std::path::PathBuf;
@@ -32,6 +33,7 @@ Commands:\n  \
   status                            Show latest known state + recommendation for all providers\n  \
   collect                           Run automatic collectors (Claude, Z.ai API), then show status\n  \
   recommend [--json]                Machine-readable routing recommendation (optional JSON)\n  \
+  route [task-class] [--runtime-secs N] [--json]  Session-open routing decision (reasoning/extraction/classifier)\n  \
   observe <provider> <percent> [--note TEXT]   Record a manual usage observation (0-100)\n  \
   limit-hit <provider> [--note TEXT]           Record that a provider just returned a 429/limit error\n  \
   start-window                     Start Claude's 5h limit clock now (cheap haiku ping)\n  \
@@ -134,6 +136,65 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        "route" => {
+            let task_class_arg = args
+                .get(2)
+                .and_then(|s| route::TaskClass::parse(s))
+                .unwrap_or(route::TaskClass::Reasoning);
+            let runtime_secs: i64 = args
+                .iter()
+                .position(|a| a == "--runtime-secs")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1800);
+            let json_mode = args[2..].iter().any(|a| a == "--json");
+
+            let states = db::latest(&conn);
+            let provider_states =
+                route::states_from_observations(&cfg.rotation_order, &states, &route_hints());
+            let thresholds = route::Thresholds {
+                warning: cfg.thresholds.warning,
+                critical: cfg.thresholds.critical,
+            };
+            let req = route::RouteRequest {
+                task_class: task_class_arg,
+                expected_runtime_secs: runtime_secs,
+            };
+            let decision = route::decide(&provider_states, &req, &thresholds);
+
+            if json_mode {
+                let ranked: Vec<serde_json::Value> = decision
+                    .ranked
+                    .iter()
+                    .map(|c| {
+                        serde_json::json!({
+                            "provider": c.provider,
+                            "reason": c.reason,
+                            "confidence": c.confidence,
+                        })
+                    })
+                    .collect();
+                let out = serde_json::json!({
+                    "recommended": decision.recommended.as_ref().map(|c| &c.provider),
+                    "reason": decision.recommended.as_ref().map(|c| &c.reason),
+                    "confidence": decision.recommended.as_ref().map(|c| c.confidence),
+                    "task_class": task_class_arg.as_str(),
+                    "ranked": ranked,
+                });
+                println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+            } else {
+                match &decision.recommended {
+                    Some(c) => println!(
+                        "Route to {} (confidence {:.2}): {}",
+                        c.provider, c.confidence, c.reason
+                    ),
+                    None => println!(
+                        "No provider has a verified observation — run `ai-usage collect` first."
+                    ),
+                }
+            }
+            ExitCode::SUCCESS
+        }
         "observe" => {
             if args.len() < 4 {
                 eprintln!("usage: ai-usage observe <provider> <percent> [--note TEXT]");
@@ -211,6 +272,38 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn route_hints() -> std::collections::HashMap<String, (route::CostTier, Vec<route::TaskClass>)> {
+    use route::{CostTier, TaskClass};
+    let mut hints = std::collections::HashMap::new();
+    hints.insert(
+        "claude-pro".to_string(),
+        (CostTier::Subscription, vec![TaskClass::Reasoning]),
+    );
+    hints.insert(
+        "chatgpt-plus".to_string(),
+        (
+            CostTier::Subscription,
+            vec![TaskClass::Reasoning, TaskClass::Extraction],
+        ),
+    );
+    hints.insert(
+        "zai-codeplus".to_string(),
+        (
+            CostTier::Subscription,
+            vec![TaskClass::Extraction, TaskClass::Classifier],
+        ),
+    );
+    hints.insert(
+        "ollama-pro".to_string(),
+        (CostTier::Metered, vec![TaskClass::Extraction]),
+    );
+    hints.insert(
+        "ollama-local".to_string(),
+        (CostTier::Local, vec![TaskClass::Classifier]),
+    );
+    hints
 }
 
 fn extract_note(rest: &[String]) -> Option<String> {
