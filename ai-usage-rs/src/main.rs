@@ -50,18 +50,26 @@ fn default_db_path() -> PathBuf {
 }
 
 fn dirs_config() -> PathBuf {
-    env::var_os("HOME")
+    env::var_os("AI_USAGE_CONFIG_PATH")
         .map(PathBuf::from)
-        .unwrap_or_default()
-        .join(".config")
+        .unwrap_or_else(|| {
+            env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_default()
+                .join(".config")
+        })
 }
 
 fn dirs_data() -> PathBuf {
-    env::var_os("HOME")
+    env::var_os("AI_USAGE_DB_PATH")
         .map(PathBuf::from)
-        .unwrap_or_default()
-        .join(".local")
-        .join("share")
+        .unwrap_or_else(|| {
+            env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_default()
+                .join(".local")
+                .join("share")
+        })
 }
 
 fn main() -> ExitCode {
