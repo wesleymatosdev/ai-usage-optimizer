@@ -91,6 +91,10 @@ mod tests {
                 daily_token_budget: None,
                 weekly_token_budget: None,
                 max_parallel_lanes: Some(n),
+                monthly_pool_dollars: None,
+                reload_monthly_max_dollars: None,
+                reset_at: None,
+                rate_limit_ttl_secs: None,
             },
         );
         Config {

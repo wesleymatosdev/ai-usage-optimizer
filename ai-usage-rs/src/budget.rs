@@ -8,6 +8,7 @@
 //! ceilings and refuses when the projection would cross either.
 
 use crate::config::Config;
+use crate::credit;
 use crate::db;
 use rusqlite::Connection;
 
@@ -32,6 +33,65 @@ pub fn now_unix() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Dollar-form budget gate for credit_balance providers: recorded credit
+/// spend + estimated dollars must stay inside the monthly pool. A refusal
+/// carries the burn-rate context so the operator sees the trajectory, not
+/// just the gate.
+pub fn check_credit(
+    conn: &Connection,
+    cfg: &Config,
+    provider: &str,
+    estimate_dollars: f64,
+    now: i64,
+) -> credit::CreditBudgetDecision {
+    let provider_cfg = cfg.providers.get(provider);
+    let plan = credit::CreditPlan {
+        monthly_pool_dollars: provider_cfg
+            .and_then(|p| p.monthly_pool_dollars)
+            .unwrap_or(60.0),
+        reset_at_unix: provider_cfg
+            .and_then(|p| p.reset_at.as_deref())
+            .and_then(crate::collectors::claude::parse_iso_to_unix)
+            .map(|f| f as i64),
+    };
+    let latest = db::latest_credit(conn, provider);
+    let used = latest.as_ref().map(|c| c.used_dollars).unwrap_or(0.0);
+    let decision = credit::credit_budget_check(&plan, used, estimate_dollars);
+    if decision.allowed {
+        return decision;
+    }
+    // Surface the burn-rate trajectory in the refusal, not just the gate.
+    if let Some(base) = penultimate_credit(conn, provider) {
+        if let Some(latest) = latest {
+            let st = credit::credit_state(&plan, &latest, Some(&base), now);
+            if let Some(rate) = st.burn_per_hour {
+                return credit::CreditBudgetDecision {
+                    message: format!("{} (burn rate ${rate:.2}/h)", decision.message),
+                    ..decision
+                };
+            }
+        }
+    }
+    decision
+}
+
+fn penultimate_credit(conn: &Connection, provider: &str) -> Option<db::CreditObservation> {
+    conn.query_row(
+        "SELECT used_dollars, COALESCE(note, ''), observed_at_unix
+         FROM credit_observations WHERE provider = ?1
+         ORDER BY id DESC LIMIT 1 OFFSET 1",
+        rusqlite::params![provider],
+        |row| {
+            Ok(db::CreditObservation {
+                used_dollars: row.get(0)?,
+                note: row.get(1)?,
+                at_unix: row.get(2)?,
+            })
+        },
+    )
+    .ok()
 }
 
 /// Evaluate a dispatch of `estimate_tokens` against the provider's ceilings.

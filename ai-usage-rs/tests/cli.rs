@@ -113,7 +113,22 @@ fn limit_hit_marks_provider_and_recommendation_routes_around_it() {
     );
     assert_eq!(code, 0);
 
+    // A limit-hit is now TRANSIENT backoff, not percent=100 exhaustion: the
+    // routing recommendation moves off claude-pro while the backoff is live,
+    // but the provider's own reading stays untouched.
     let parsed = recommend_json(&cfg, &db);
+    let claude = parsed["candidates"]
+        .as_array()
+        .expect("candidates array")
+        .iter()
+        .find(|c| c["provider"] == "claude-pro")
+        .expect("claude-pro among candidates")
+        .clone();
+    assert_eq!(claude["verdict"], "backoff");
+    assert_eq!(
+        claude["percent"], 20.0,
+        "429 must not overwrite the reading"
+    );
     assert_eq!(parsed["recommended"], serde_json::Value::Null);
 
     let status = run(&["status"], &cfg, &db).1;
@@ -122,8 +137,8 @@ fn limit_hit_marks_provider_and_recommendation_routes_around_it() {
         "status lists claude-pro: {status}"
     );
     assert!(
-        status.contains("limit-hit"),
-        "status shows source: {status}"
+        status.contains("manual"),
+        "status keeps the durable reading's source: {status}"
     );
 }
 

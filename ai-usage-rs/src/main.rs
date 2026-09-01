@@ -12,6 +12,7 @@ mod alert;
 mod budget;
 mod collectors;
 mod config;
+mod credit;
 mod db;
 mod lanes;
 mod route;
@@ -38,12 +39,15 @@ Commands:\n  \
   recommend [--json]                Machine-readable routing recommendation (optional JSON)\n  \
   route [task-class] [--runtime-secs N] [--json]  Session-open routing decision (reasoning/extraction/classifier)\n  \
   observe <provider> <percent> [--note TEXT]   Record a manual usage observation (0-100)\n  \
-  limit-hit <provider> [--note TEXT]           Record that a provider just returned a 429/limit error\n  \
+  credit observe <provider> <used_dollars> [--note TEXT]   Record monthly credit dollars consumed\n  \
+  credit status [provider]          Credit-balance detail: remaining, burn rate, projection\n  \
+  limit-hit <provider> [--note TEXT] [--ttl-secs N]   Record a transient 429 (backoff; never touches the balance)\n  \
   start-window                      Start Claude's 5h limit clock now (cheap haiku ping)\n  \
   alert                             Push Telegram alerts on level transitions (ok/warning/critical)\n  \
-  budget check <provider> <estimate>          Refuse dispatches that would cross hard daily/weekly ceilings\n  \
-  budget record <provider> <tokens> [--at-unix TS]   Record actual tokens a dispatch consumed\n\
-\nProviders: claude-pro, zai-codeplus, chatgpt-plus, ollama-pro, ollama-local\n\nNote: --note TEXT is visible via `ps` and shell history. Do not include\nsecrets, tokens, or sensitive context in note arguments.\n"
+  budget check <provider> <estimate>          Refuse dispatches crossing the ceiling (dollars for credit providers, tokens otherwise)\n  \
+  budget record <provider> <tokens> [--at-unix TS]   Record actual tokens a dispatch consumed\n\n\
+Providers: claude-pro, zai-codeplus, chatgpt-plus, ollama-pro, ollama-local\n\n\
+Credit providers (ollama-pro) model a monthly DOLLAR pool, not a rate limit:\nrecord dollars consumed with `credit observe`; 429s are transient backoff\nand never touch the balance. Note: --note TEXT is visible via `ps` and shell\nhistory. Do not include secrets, tokens, or sensitive context in note arguments.\n"
 }
 
 fn default_config_path() -> PathBuf {
@@ -119,7 +123,7 @@ fn main() -> ExitCode {
         "recommend" => {
             let json_mode = args[2..].iter().any(|a| a == "--json");
             let states = db::latest(&conn);
-            let rec = recommendation(&cfg, &states);
+            let rec = recommendation(&conn, &cfg, &states);
             if json_mode {
                 // Explicit verdicts for EVERY rotation-order provider — the
                 // silent filter_map that dropped unknown providers is what
@@ -128,7 +132,8 @@ fn main() -> ExitCode {
                 // policy-refused provider carries the `local-first` verdict
                 // in `candidates` AND the `excluded` map — a machine consumer
                 // never sees a suppressed provider as dispatchable.
-                let classified = routing::classify_all(&cfg, &states);
+                let backoff = backoff_providers(&conn);
+                let classified = routing::classify_all(&cfg, &states, &backoff);
                 let candidates: Vec<serde_json::Value> = classified
                     .iter()
                     .map(|c| {
@@ -251,7 +256,7 @@ fn main() -> ExitCode {
         }
         "limit-hit" => {
             if args.len() < 3 {
-                eprintln!("usage: ai-usage limit-hit <provider> [--note TEXT]");
+                eprintln!("usage: ai-usage limit-hit <provider> [--note TEXT] [--ttl-secs N]");
                 return ExitCode::FAILURE;
             }
             let provider = &args[2];
@@ -260,14 +265,35 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
             let note = extract_note(&args[3..])
-                .unwrap_or_else(|| "provider reported limit/rate exhaustion".to_string());
-            if let Err(e) = db::observe(&conn, provider, Some(100.0), "limit-hit", &note) {
+                .unwrap_or_else(|| "provider returned 429/session rate limit".to_string());
+            let ttl = args[3..]
+                .iter()
+                .position(|a| a == "--ttl-secs")
+                .and_then(|i| args[3..].get(i + 1))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(db::DEFAULT_RATE_LIMIT_TTL_SECS);
+            let at_unix = args[3..]
+                .iter()
+                .position(|a| a == "--at-unix")
+                .and_then(|i| args[3..].get(i + 1))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(db::now_unix());
+            // A 429 is TRANSIENT: a rate_limit_event with a TTL, never a
+            // percent=100 observation. The credit balance is untouched.
+            if let Err(e) = db::record_rate_limit(&conn, provider, &note, at_unix, ttl) {
                 eprintln!("db error: {e}");
                 return ExitCode::FAILURE;
             }
-            println!("recorded");
+            println!("recorded (transient backoff, ttl {ttl}s)");
             ExitCode::SUCCESS
         }
+        "credit" => match cmd_credit(&args[2..], &conn, &cfg) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        },
         "start-window" => {
             // Start Claude's 5h clock NOW with a cheap haiku ping, then observe
             // the fresh window so the tracker reflects it immediately.
@@ -345,31 +371,53 @@ fn main() -> ExitCode {
                         eprintln!("unknown provider: {provider}. Valid: {:?}", PROVIDERS);
                         return ExitCode::FAILURE;
                     }
-                    let estimate: Option<u64> = match rest.next() {
-                        Some(t) => match t.parse() {
-                            Ok(v) => Some(v),
-                            Err(_) => {
-                                eprintln!("estimate must be a non-negative integer");
-                                return ExitCode::FAILURE;
-                            }
-                        },
-                        None => None,
-                    };
-                    let Some(estimate) = estimate else {
+                    let estimate: Option<String> = rest.next().cloned();
+                    let Some(estimate_str) = estimate else {
                         eprintln!(
                             "refused: no cost estimate — every dispatch must declare its \
-                             estimated tokens before running (budget check <provider> <tokens>)"
+                             estimated cost before running (budget check <provider> <tokens|dollars>)"
                         );
                         return ExitCode::FAILURE;
                     };
-                    let decision =
-                        budget::check(&conn, &cfg, &provider, estimate, budget::now_unix());
-                    if decision.allowed {
-                        println!("{}", decision.message);
-                        ExitCode::SUCCESS
+                    let now = budget::now_unix();
+                    let is_credit = cfg
+                        .providers
+                        .get(&provider)
+                        .map(|p| p.kind == "credit_balance")
+                        .unwrap_or(false);
+                    if is_credit {
+                        // Credit providers budget in DOLLARS against the
+                        // monthly pool — a token count is the wrong quantity.
+                        let Ok(estimate_dollars) = estimate_str.parse::<f64>() else {
+                            eprintln!("estimate must be dollars for credit providers (e.g. 0.05)");
+                            return ExitCode::FAILURE;
+                        };
+                        if estimate_dollars < 0.0 {
+                            eprintln!("estimate must be non-negative");
+                            return ExitCode::FAILURE;
+                        }
+                        let d = budget::check_credit(&conn, &cfg, &provider, estimate_dollars, now);
+                        if d.allowed {
+                            println!("{}", d.message);
+                            ExitCode::SUCCESS
+                        } else {
+                            eprintln!("{}", d.message);
+                            ExitCode::FAILURE
+                        }
                     } else {
-                        eprintln!("{}", decision.message);
-                        ExitCode::FAILURE
+                        let Ok(estimate) = estimate_str.parse::<u64>() else {
+                            eprintln!("estimate must be a non-negative integer");
+                            return ExitCode::FAILURE;
+                        };
+                        let decision =
+                            budget::check(&conn, &cfg, &provider, estimate, budget::now_unix());
+                        if decision.allowed {
+                            println!("{}", decision.message);
+                            ExitCode::SUCCESS
+                        } else {
+                            eprintln!("{}", decision.message);
+                            ExitCode::FAILURE
+                        }
                     }
                 }
                 other => {
@@ -475,6 +523,188 @@ fn extract_note(rest: &[String]) -> Option<String> {
     None
 }
 
+/// `credit` subcommands — the dollar-form surface for credit_balance providers.
+fn cmd_credit(
+    args: &[String],
+    conn: &rusqlite::Connection,
+    cfg: &config::Config,
+) -> Result<ExitCode, String> {
+    let sub = args.first().map(String::as_str).unwrap_or("");
+    match sub {
+        "observe" => {
+            let provider = args.get(1).ok_or_else(|| {
+                "usage: ai-usage credit observe <provider> <used_dollars> [--note TEXT]".to_string()
+            })?;
+            if !PROVIDERS.contains(&provider.as_str()) {
+                return Err(format!("unknown provider: {provider}. Valid: {PROVIDERS:?}"));
+            }
+            let used: f64 = args
+                .get(2)
+                .and_then(|s| s.parse().ok())
+                .ok_or("used_dollars must be a number (e.g. 5.10)")?;
+            if !(0.0..=100_000.0).contains(&used) {
+                return Err("used_dollars must be >= 0".to_string());
+            }
+            let note = extract_note(&args[3..]).unwrap_or_else(|| "dashboard reading".to_string());
+            let at_unix = args[3..]
+                .iter()
+                .position(|a| a == "--at-unix")
+                .and_then(|i| args[3..].get(i + 1))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(db::now_unix());
+            db::record_credit(conn, provider, used, &note, at_unix)
+                .map_err(|e| format!("db error: {e}"))?;
+            // Mirror into observations (derived percent) so percent-based
+            // routing/alerts see credit providers on the same surface.
+            if let Some(p) = cfg.providers.get(provider) {
+                if p.kind == "credit_balance" {
+                    let pool = p.monthly_pool_dollars.unwrap_or(60.0);
+                    let pct = if pool > 0.0 {
+                        (used / pool * 100.0).clamp(0.0, 100.0)
+                    } else {
+                        0.0
+                    };
+                    let note = format!("${used:.2} of ${pool:.2} monthly pool");
+                    db::observe(conn, provider, Some(pct), "credit", &note)
+                        .map_err(|e| format!("db error: {e}"))?;
+                }
+            }
+            println!("recorded");
+            Ok(ExitCode::SUCCESS)
+        }
+        "status" => {
+            let provider = args.get(1).cloned().unwrap_or_else(|| "ollama-pro".into());
+            if !PROVIDERS.contains(&provider.as_str()) {
+                return Err(format!("unknown provider: {provider}. Valid: {PROVIDERS:?}"));
+            }
+            print_credit_status(conn, cfg, &provider, db::now_unix());
+            Ok(ExitCode::SUCCESS)
+        }
+        other => Err(format!(
+            "unknown credit subcommand: {other}\nusage: ai-usage credit observe <provider> <used_dollars> | credit status [provider]"
+        )),
+    }
+}
+
+/// Credit detail: dollars consumed / remaining, burn rate, projected spend at
+/// reset. Pure reporting — never probes any endpoint.
+fn print_credit_status(
+    conn: &rusqlite::Connection,
+    cfg: &config::Config,
+    provider: &str,
+    now: i64,
+) {
+    let Some(p) = cfg.providers.get(provider) else {
+        println!("{provider}: not configured");
+        return;
+    };
+    if p.kind != "credit_balance" {
+        println!(
+            "{provider}: not a credit_balance provider (kind {})",
+            p.kind
+        );
+        return;
+    }
+    let reset_at = p
+        .reset_at
+        .as_deref()
+        .and_then(crate::collectors::claude::parse_iso_to_unix)
+        .map(|f| f as i64);
+    let plan = credit::CreditPlan {
+        monthly_pool_dollars: p.monthly_pool_dollars.unwrap_or(60.0),
+        reset_at_unix: reset_at,
+    };
+    let latest = db::latest_credit(conn, provider);
+    let Some(latest) = latest else {
+        println!(
+            "{provider}: no credit readings — run `ai-usage credit observe {provider} <dollars>`"
+        );
+        return;
+    };
+    // Earliest reading still inside the current period = burn baseline.
+    let baseline = period_baseline(conn, provider, latest.at_unix);
+    let state = credit::credit_state(&plan, &latest, baseline.as_ref(), now);
+    println!(
+        "{provider}: ${:.2} used of ${:.2} pool ({:.1}%), ${:.2} remaining",
+        state.used_dollars, state.pool_dollars, state.percent_used, state.remaining_dollars
+    );
+    if let Some(reload) = p.reload_monthly_max_dollars {
+        println!("  safety net: auto-reload monthly max ${reload:.2} (balance $0)");
+    }
+    match state.burn_per_hour {
+        Some(rate) => println!("  burn rate: ${rate:.2}/h (from recorded readings)"),
+        None => println!("  burn rate: need 2+ readings in this period"),
+    }
+    match (state.projected_at_reset, plan.reset_at_unix) {
+        (Some(projected), Some(reset)) => println!(
+            "  projected at reset ({}): ${:.2} of ${:.2} pool",
+            human_duration(reset.saturating_sub(now)),
+            projected,
+            plan.monthly_pool_dollars
+        ),
+        _ => println!("  projection: needs both a burn rate and a configured reset date"),
+    }
+    let backoffs = db::active_rate_limits(conn, provider, now);
+    if !backoffs.is_empty() {
+        let e = &backoffs[0];
+        println!(
+            "  transient 429 backoff active for {} (balance unaffected)",
+            human_duration(e.expires_at().saturating_sub(now))
+        );
+    }
+}
+
+fn period_baseline(
+    conn: &rusqlite::Connection,
+    provider: &str,
+    latest_at: i64,
+) -> Option<db::CreditObservation> {
+    // Second-latest reading overall is the simplest honest baseline; a
+    // period-aware query can come later once resets are recorded.
+    conn.query_row(
+        "SELECT used_dollars, COALESCE(note, ''), observed_at_unix
+         FROM credit_observations WHERE provider = ?1 AND observed_at_unix < ?2
+         ORDER BY id DESC LIMIT 1",
+        rusqlite::params![provider, latest_at],
+        |row| {
+            Ok(db::CreditObservation {
+                used_dollars: row.get(0)?,
+                note: row.get(1)?,
+                at_unix: row.get(2)?,
+            })
+        },
+    )
+    .ok()
+}
+
+fn human_duration(secs: i64) -> String {
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    if h > 0 {
+        format!("{h}h{m:02}m")
+    } else {
+        format!("{m}m")
+    }
+}
+
+/// Providers with a currently-active transient 429/rate-limit event — the
+/// `backoff` verdict input for routing. Kept tiny and conn-taking so both
+/// `recommend --json` and `recommendation()` share one source of truth.
+fn backoff_providers(conn: &rusqlite::Connection) -> std::collections::HashSet<String> {
+    backoff_providers_conn(conn)
+}
+
+fn backoff_providers_conn(conn: &rusqlite::Connection) -> std::collections::HashSet<String> {
+    let now = db::now_unix();
+    let mut out = std::collections::HashSet::new();
+    for provider in PROVIDERS {
+        if !db::active_rate_limits(conn, provider, now).is_empty() {
+            out.insert(provider.to_string());
+        }
+    }
+    out
+}
+
 fn run_collect(conn: &rusqlite::Connection, cfg: &config::Config) {
     // Collectors that hard-fail must leave an explicit UNAVAILABLE marker
     // (percent NULL) — a silent eprintln made "quota source down" and
@@ -571,7 +801,7 @@ fn print_status(conn: &rusqlite::Connection, cfg: &config::Config) {
             None => println!("{provider:14} unknown — no observation"),
         }
     }
-    let rec = recommendation(cfg, &states);
+    let rec = recommendation(conn, cfg, &states);
     println!("{}", rec.text);
     fire_alerts(conn, cfg, &states, &rec.text);
 }
@@ -584,6 +814,7 @@ struct Recommendation {
 }
 
 fn recommendation(
+    conn: &rusqlite::Connection,
     cfg: &config::Config,
     states: &std::collections::HashMap<String, db::Observation>,
 ) -> Recommendation {
@@ -592,7 +823,8 @@ fn recommendation(
     // policy is applied inside classify_all (single source of truth), so a
     // provider the policy refuses carries the `local-first` verdict there
     // and can never be recommended here.
-    let classified = routing::classify_all(cfg, states);
+    let backoff = backoff_providers_conn(conn);
+    let classified = routing::classify_all(cfg, states, &backoff);
     let mut candidates: Vec<(f64, &str)> = classified
         .iter()
         .filter(|c| c.verdict == routing::Verdict::Eligible && c.has_headroom)

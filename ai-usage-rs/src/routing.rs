@@ -10,11 +10,19 @@
 //! - `local-first` — eligible with headroom on raw percentages, but the
 //!   local-first policy suppresses it because the unmetered local runtime is
 //!   comparably fresh: policy-refused, must never be dispatched.
-//! - `exhausted`   — at/above the critical threshold, or a limit-hit was
-//!   recorded: dispatches will fail.
+//! - `backoff`     — a TRANSIENT session 429/rate-limit event is active
+//!   (within its TTL). Short-lived: retry shortly. Distinct from `exhausted`
+//!   because a 429 on one subagent says nothing about plan/credit state.
+//! - `exhausted`   — at/above the critical threshold on the DURABLE signal
+//!   (monthly consumption percent, or an expired-limit session window):
+//!   dispatches will fail for the rest of the period.
 //! - `unknown`     — never observed: routing must not assume headroom.
 //! - `unavailable` — the collector explicitly reported the quota source as
 //!   unavailable (no percentage exists).
+//!
+//! Legacy sticky rows: a `limit-hit` observation older than
+//! `db::LIMIT_HIT_TTL_SECS` is filtered out by `db::latest()` itself, so it
+//! can never reach this module and render as plan exhaustion.
 
 use crate::config::Config;
 use crate::db::Observation;
@@ -38,6 +46,8 @@ fn now_unix() -> i64 {
 pub enum Verdict {
     Eligible,
     LocalFirst,
+    /// Transient 429/rate-limit backoff — clears with the event TTL.
+    Backoff,
     Exhausted,
     Unknown,
     Unavailable,
@@ -48,6 +58,7 @@ impl Verdict {
         match self {
             Verdict::Eligible => "eligible",
             Verdict::LocalFirst => "local-first",
+            Verdict::Backoff => "backoff",
             Verdict::Exhausted => "exhausted",
             Verdict::Unknown => "unknown",
             Verdict::Unavailable => "unavailable",
@@ -68,7 +79,16 @@ pub struct VerdictedCandidate {
 }
 
 /// Classify one provider's latest observation into a routing verdict.
-pub fn classify(cfg: &Config, state: Option<&Observation>, provider: &str) -> VerdictedCandidate {
+///
+/// `in_backoff`: a currently-active transient rate-limit event exists (checked
+/// by the caller against `db::rate_limit_events`, which is why it is a
+/// parameter and not a DB read — this function stays pure).
+pub fn classify(
+    cfg: &Config,
+    state: Option<&Observation>,
+    provider: &str,
+    in_backoff: bool,
+) -> VerdictedCandidate {
     let Some(state) = state else {
         return VerdictedCandidate {
             provider: provider.to_string(),
@@ -99,9 +119,20 @@ pub fn classify(cfg: &Config, state: Option<&Observation>, provider: &str) -> Ve
         };
     };
 
-    if state.source == "limit-hit" || pct >= cfg.thresholds.critical {
+    if pct >= cfg.thresholds.critical {
         return VerdictedCandidate {
             verdict: Verdict::Exhausted,
+            ..base
+        };
+    }
+
+    // A live 429 is short-lived backoff, layered over whatever the durable
+    // reading says. It NEVER manufactures a 100% reading (the old
+    // `source == "limit-hit"` check did exactly that). The in_backoff flag
+    // is the primary signal; the legacy observation row is belt-and-braces.
+    if in_backoff || state.source == "limit-hit" {
+        return VerdictedCandidate {
+            verdict: Verdict::Backoff,
             ..base
         };
     }
@@ -119,9 +150,14 @@ pub fn classify(cfg: &Config, state: Option<&Observation>, provider: &str) -> Ve
 /// from `recommendation()` is applied HERE, so a provider the policy refuses
 /// is marked `local-first` with `has_headroom: false` — machine consumers
 /// reading `recommend --json` never see a suppressed provider as dispatchable.
+///
+/// `backoff_providers`: providers with a currently-active transient 429 event
+/// (computed by the caller from `db::active_rate_limits`, keeping this
+/// function pure and testable).
 pub fn classify_all(
     cfg: &Config,
     states: &HashMap<String, Observation>,
+    backoff_providers: &std::collections::HashSet<String>,
 ) -> Vec<VerdictedCandidate> {
     let local_pct = states.get("ollama-local").and_then(|s| s.percent);
     let suppresses = |provider: &str, pct: f64| -> bool {
@@ -136,7 +172,8 @@ pub fn classify_all(
     cfg.rotation_order
         .iter()
         .map(|p| {
-            let mut c = classify(cfg, states.get(p), p);
+            let in_backoff = backoff_providers.contains(p);
+            let mut c = classify(cfg, states.get(p), p, in_backoff);
             if c.verdict == Verdict::Eligible
                 && c.has_headroom
                 && suppresses(p, c.percent.expect("eligible implies percent"))
@@ -189,6 +226,7 @@ pub fn reset_in_secs_from_note(note: &str, now_unix: i64) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     fn cfg() -> Config {
         Config::default_config()
@@ -205,7 +243,7 @@ mod tests {
 
     #[test]
     fn missing_observation_is_unknown_and_has_no_headroom() {
-        let c = classify(&cfg(), None, "claude-pro");
+        let c = classify(&cfg(), None, "claude-pro", false);
         assert_eq!(c.verdict, Verdict::Unknown);
         assert!(!c.has_headroom);
         assert_eq!(c.percent, None);
@@ -213,34 +251,84 @@ mod tests {
 
     #[test]
     fn unavailable_observation_stays_unavailable_not_zero_usage() {
-        let c = classify(&cfg(), Some(&obs(None, "unavailable")), "zai-codeplus");
+        let c = classify(
+            &cfg(),
+            Some(&obs(None, "unavailable")),
+            "zai-codeplus",
+            false,
+        );
         assert_eq!(c.verdict, Verdict::Unavailable);
         assert!(!c.has_headroom);
     }
 
     #[test]
     fn critical_reading_is_exhausted() {
-        let c = classify(&cfg(), Some(&obs(Some(96.0), "direct-api")), "zai-codeplus");
+        let c = classify(
+            &cfg(),
+            Some(&obs(Some(96.0), "direct-api")),
+            "zai-codeplus",
+            false,
+        );
         assert_eq!(c.verdict, Verdict::Exhausted);
         assert!(!c.has_headroom);
     }
 
     #[test]
-    fn limit_hit_source_is_exhausted_even_below_critical() {
-        let c = classify(&cfg(), Some(&obs(Some(10.0), "limit-hit")), "ollama-pro");
-        assert_eq!(c.verdict, Verdict::Exhausted);
+    fn limit_hit_is_transient_backoff_and_never_manufactures_exhaustion() {
+        // THE regression from the incident: a 10%-used provider with a stale
+        // limit-hit row was reported as 100% exhausted. A limit-hit is
+        // short-lived backoff; the durable reading stays untouched.
+        let c = classify(
+            &cfg(),
+            Some(&obs(Some(10.0), "limit-hit")),
+            "ollama-pro",
+            false,
+        );
+        assert_eq!(c.verdict, Verdict::Backoff);
+        assert_eq!(
+            c.percent,
+            Some(10.0),
+            "backoff must not overwrite the balance"
+        );
+    }
+
+    #[test]
+    fn active_rate_limit_event_overrides_eligible_with_backoff() {
+        // A healthy 8% credit reading + a live 429 event → backoff, while
+        // percent stays 8% (dollars untouched by the transient event).
+        let c = classify(&cfg(), Some(&obs(Some(8.5), "credit")), "ollama-pro", true);
+        assert_eq!(c.verdict, Verdict::Backoff);
+        assert_eq!(c.percent, Some(8.5));
+        assert!(!c.has_headroom, "backoff is not dispatchable while active");
+    }
+
+    #[test]
+    fn expired_rate_limit_event_restores_eligibility() {
+        let c = classify(&cfg(), Some(&obs(Some(8.5), "credit")), "ollama-pro", false);
+        assert_eq!(c.verdict, Verdict::Eligible);
+        assert!(c.has_headroom);
     }
 
     #[test]
     fn healthy_reading_is_eligible_with_headroom() {
-        let c = classify(&cfg(), Some(&obs(Some(30.0), "manual")), "chatgpt-plus");
+        let c = classify(
+            &cfg(),
+            Some(&obs(Some(30.0), "manual")),
+            "chatgpt-plus",
+            false,
+        );
         assert_eq!(c.verdict, Verdict::Eligible);
         assert!(c.has_headroom);
     }
 
     #[test]
     fn warning_level_reading_is_eligible_but_has_no_headroom() {
-        let c = classify(&cfg(), Some(&obs(Some(91.0), "manual")), "chatgpt-plus");
+        let c = classify(
+            &cfg(),
+            Some(&obs(Some(91.0), "manual")),
+            "chatgpt-plus",
+            false,
+        );
         assert_eq!(c.verdict, Verdict::Eligible);
         assert!(!c.has_headroom);
     }
@@ -251,7 +339,7 @@ mod tests {
         states.insert("ollama-local".to_string(), obs(Some(40.0), "manual"));
         states.insert("claude-pro".to_string(), obs(Some(20.0), "manual"));
 
-        let out = classify_all(&cfg(), &states);
+        let out = classify_all(&cfg(), &states, &HashSet::new());
         let claude = out.iter().find(|c| c.provider == "claude-pro").unwrap();
         // 20 + 25 = 45 > 40 → the local-first policy suppresses claude-pro
         // even though it is eligible with headroom on raw percentages.
@@ -264,12 +352,37 @@ mod tests {
     }
 
     #[test]
+    fn classify_all_marks_backoff_from_the_event_set() {
+        let mut states = HashMap::new();
+        states.insert("ollama-pro".to_string(), obs(Some(8.5), "credit"));
+        let mut backoff = HashSet::new();
+        backoff.insert("ollama-pro".to_string());
+
+        let out = classify_all(&cfg(), &states, &backoff);
+        let p = out.iter().find(|c| c.provider == "ollama-pro").unwrap();
+        assert_eq!(p.verdict, Verdict::Backoff);
+        assert!(!p.has_headroom);
+        assert_eq!(p.percent, Some(8.5));
+
+        // Same states, no active events → eligible.
+        let out = classify_all(&cfg(), &states, &HashSet::new());
+        assert_eq!(*c_verdict(&out, "ollama-pro"), Verdict::Eligible);
+    }
+
+    fn c_verdict<'a>(out: &'a [VerdictedCandidate], provider: &str) -> &'a Verdict {
+        &out.iter()
+            .find(|c| c.provider == provider)
+            .expect("provider present")
+            .verdict
+    }
+
+    #[test]
     fn local_first_suppression_requires_a_local_reading_and_respects_toggle() {
         let mut states = HashMap::new();
         states.insert("claude-pro".to_string(), obs(Some(20.0), "manual"));
 
         // No ollama-local reading → policy cannot fire.
-        let out = classify_all(&cfg(), &states);
+        let out = classify_all(&cfg(), &states, &HashSet::new());
         assert_eq!(out[0].verdict, Verdict::Eligible);
         assert!(out[0].has_headroom);
 
@@ -278,7 +391,7 @@ mod tests {
         cfg.local_first = false;
         let mut with_local = states.clone();
         with_local.insert("ollama-local".to_string(), obs(Some(40.0), "manual"));
-        let out = classify_all(&cfg, &with_local);
+        let out = classify_all(&cfg, &with_local, &HashSet::new());
         assert_eq!(out[0].verdict, Verdict::Eligible);
         assert!(out[0].has_headroom);
     }
@@ -288,7 +401,7 @@ mod tests {
         let mut states = HashMap::new();
         states.insert("claude-pro".to_string(), obs(Some(10.0), "manual"));
         states.insert("chatgpt-plus".to_string(), obs(Some(20.0), "manual"));
-        let out = classify_all(&cfg(), &states);
+        let out = classify_all(&cfg(), &states, &HashSet::new());
         assert_eq!(
             out.iter().map(|c| c.provider.as_str()).collect::<Vec<_>>(),
             vec![
@@ -305,7 +418,7 @@ mod tests {
 
     #[test]
     fn classify_all_covers_providers_missing_from_the_state_map() {
-        let out = classify_all(&cfg(), &HashMap::new());
+        let out = classify_all(&cfg(), &HashMap::new(), &HashSet::new());
         assert!(out.iter().all(|c| c.verdict == Verdict::Unknown));
         assert_eq!(out.len(), 5);
     }
