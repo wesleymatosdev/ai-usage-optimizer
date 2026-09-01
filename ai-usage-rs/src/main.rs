@@ -629,7 +629,10 @@ fn print_credit_status(
         state.used_dollars, state.pool_dollars, state.percent_used, state.remaining_dollars
     );
     if let Some(reload) = p.reload_monthly_max_dollars {
-        println!("  safety net: auto-reload monthly max ${reload:.2} (balance $0)");
+        println!(
+            "  extra usage: opt-in pay-as-you-go balance, monthly cap ${reload:.2} \
+             (draws only after the included pool hits $0)"
+        );
     }
     match state.burn_per_hour {
         Some(rate) => println!("  burn rate: ${rate:.2}/h (from recorded readings)"),
@@ -765,6 +768,20 @@ fn run_collect(conn: &rusqlite::Connection, cfg: &config::Config) {
         Err(e) => {
             eprintln!("Z.ai quota request failed: {e}");
             record_failure(conn, "zai-codeplus", &e);
+        }
+    }
+
+    match collectors::deepseek::collect(cfg) {
+        Ok(Some((pct, note))) => {
+            if let Err(e) = db::observe(conn, "deepseek", Some(pct), "direct-api", &note) {
+                eprintln!("db error recording deepseek: {e}");
+            }
+        }
+        // Ok(None) = not configured or no key — silent by design (optional provider)
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("DeepSeek quota request failed: {e}");
+            record_failure(conn, "deepseek", &e);
         }
     }
 

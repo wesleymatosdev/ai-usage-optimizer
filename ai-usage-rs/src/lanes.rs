@@ -95,6 +95,7 @@ mod tests {
                 reload_monthly_max_dollars: None,
                 reset_at: None,
                 rate_limit_ttl_secs: None,
+                floor_usd: None,
             },
         );
         Config {

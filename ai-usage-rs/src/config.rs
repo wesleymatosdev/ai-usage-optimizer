@@ -35,8 +35,10 @@ pub struct ProviderConfig {
     /// Full monthly dollar pool (credit_balance kind only).
     #[serde(default)]
     pub monthly_pool_dollars: Option<f64>,
-    /// Safety net surfaced in status (e.g. auto-reload monthly max $40); the
-    /// hard gate is the pool itself.
+    /// Opt-in pay-as-you-go extra-usage balance cap, surfaced in status.
+    /// Ollama has NO automatic reload: when the included pool hits $0, cloud
+    /// usage draws from this balance only if Wesley explicitly added extra
+    /// credits. Absent (the default) = the pool is the hard stop.
     #[serde(default)]
     pub reload_monthly_max_dollars: Option<f64>,
     /// When the credit pool resets, RFC3339 UTC (credit_balance kind only).
@@ -45,6 +47,11 @@ pub struct ProviderConfig {
     /// Transient 429 backoff TTL in seconds (default 900).
     #[serde(default)]
     pub rate_limit_ttl_secs: Option<i64>,
+    /// DeepSeek (pay-as-you-go): balance floor in USD for the burn model.
+    /// percent = 100 × (1 − balance/floor), clamped [0,100]. 0/absent with
+    /// kind "deepseek_payg" and no key = collector skips silently.
+    #[serde(default)]
+    pub floor_usd: Option<f64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -77,12 +84,18 @@ fn ollama_local_config() -> ProviderConfig {
         reload_monthly_max_dollars: None,
         reset_at: None,
         rate_limit_ttl_secs: None,
+                floor_usd: None,
     }
 }
 
-/// Ollama Pro's real model (2026-09): a $60/month credit balance with a reset
-/// date — NOT a rate limit. Transient 429s get a 15-minute backoff TTL that
-/// never touches the balance figure.
+/// Ollama Pro's real model (2026-09, verified against ollama.com/pricing and
+/// ollama.com/blog/transparent-pricing): Pro is $20/mo and includes $60 of
+/// DOLLAR-DENOMINATED usage credits per month — not a rate limit, and no
+/// 5-hour/weekly session limits. Credits reset monthly on the subscription's
+/// start day; unused credits do NOT roll over; when the pool hits $0, Ollama
+/// draws from an OPT-IN pay-as-you-go extra-usage balance (there is no
+/// automatic reload). Transient 429s get a 15-minute backoff TTL that never
+/// touches the balance figure.
 fn ollama_pro_credit_config() -> ProviderConfig {
     ProviderConfig {
         kind: "credit_balance".to_string(),
@@ -90,16 +103,21 @@ fn ollama_pro_credit_config() -> ProviderConfig {
         api_key_env: None,
         endpoint: None,
         note: Some(
-            "Ollama Pro: $60/month credit pool. Observe with `ai-usage credit observe`."
+            "Ollama Pro: $60/month usage credits (dollar-denominated), \
+             resets monthly on the subscription start day. Observe with \
+             `ai-usage credit observe`."
                 .to_string(),
         ),
         daily_token_budget: None,
         weekly_token_budget: None,
         max_parallel_lanes: None,
         monthly_pool_dollars: Some(60.0),
-        reload_monthly_max_dollars: Some(40.0),
+        // No auto-reload exists: overage is opt-in pay-as-you-go extra
+        // credits. Set this only if Wesley enables an extra-usage balance.
+        reload_monthly_max_dollars: None,
         reset_at: None,
         rate_limit_ttl_secs: None,
+                floor_usd: None,
     }
 }
 
@@ -123,6 +141,7 @@ impl Config {
                 reload_monthly_max_dollars: None,
                 reset_at: None,
                 rate_limit_ttl_secs: None,
+                floor_usd: None,
             },
         );
         providers.insert(
@@ -140,6 +159,7 @@ impl Config {
                 reload_monthly_max_dollars: None,
                 reset_at: None,
                 rate_limit_ttl_secs: None,
+                floor_usd: None,
             },
         );
         providers.insert(
@@ -157,6 +177,7 @@ impl Config {
                 reload_monthly_max_dollars: None,
                 reset_at: None,
                 rate_limit_ttl_secs: None,
+                floor_usd: None,
             },
         );
         providers.insert("ollama-pro".to_string(), ollama_pro_credit_config());
@@ -282,7 +303,7 @@ mod tests {
         let p = config.providers.get("ollama-pro").expect("ollama-pro");
         assert_eq!(p.kind, "credit_balance");
         assert_eq!(p.monthly_pool_dollars, Some(60.0));
-        assert_eq!(p.reload_monthly_max_dollars, Some(40.0));
+        assert_eq!(p.reload_monthly_max_dollars, None);
 
         // Migration is idempotent: a credit_balance config loads unchanged.
         let json = serde_json::to_string_pretty(&config).unwrap();
