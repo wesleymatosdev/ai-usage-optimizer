@@ -84,7 +84,7 @@ fn ollama_local_config() -> ProviderConfig {
         reload_monthly_max_dollars: None,
         reset_at: None,
         rate_limit_ttl_secs: None,
-                floor_usd: None,
+        floor_usd: None,
     }
 }
 
@@ -117,7 +117,7 @@ fn ollama_pro_credit_config() -> ProviderConfig {
         reload_monthly_max_dollars: None,
         reset_at: None,
         rate_limit_ttl_secs: None,
-                floor_usd: None,
+        floor_usd: None,
     }
 }
 
