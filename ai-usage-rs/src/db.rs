@@ -57,6 +57,12 @@ pub fn open(path: &Path) -> SqlResult<Connection> {
             percent REAL NOT NULL,
             message TEXT NOT NULL,
             fired_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS spend (
+            id INTEGER PRIMARY KEY,
+            provider TEXT NOT NULL,
+            tokens INTEGER NOT NULL,
+            at_unix INTEGER NOT NULL
         );",
     )?;
     Ok(conn)
@@ -118,6 +124,30 @@ pub fn alert(
         params![provider, level, percent, message, now_iso()],
     )?;
     Ok(())
+}
+
+// --- spend ledger (budget guardrails) --------------------------------------
+
+/// Record tokens consumed by a dispatch on a provider. `at_unix` allows
+/// backdating (tests, import); pass the current time for live entries.
+pub fn record_spend(conn: &Connection, provider: &str, tokens: u64, at_unix: i64) -> SqlResult<()> {
+    conn.execute(
+        "INSERT INTO spend (provider, tokens, at_unix) VALUES (?1, ?2, ?3)",
+        params![provider, tokens as i64, at_unix],
+    )?;
+    Ok(())
+}
+
+/// Sum of recorded spend for a provider in [from_unix, to_unix].
+pub fn spend_since(conn: &Connection, provider: &str, from_unix: i64, to_unix: i64) -> u64 {
+    conn.query_row(
+        "SELECT COALESCE(SUM(tokens), 0) FROM spend
+         WHERE provider = ?1 AND at_unix >= ?2 AND at_unix <= ?3",
+        params![provider, from_unix, to_unix],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|v| v.max(0) as u64)
+    .unwrap_or(0)
 }
 
 #[allow(dead_code)]

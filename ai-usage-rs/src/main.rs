@@ -9,6 +9,7 @@
 //! cloud remains manual because it exposes no documented subscription quota.
 
 mod alert;
+mod budget;
 mod collectors;
 mod config;
 mod db;
@@ -37,8 +38,10 @@ Commands:\n  \
   route [task-class] [--runtime-secs N] [--json]  Session-open routing decision (reasoning/extraction/classifier)\n  \
   observe <provider> <percent> [--note TEXT]   Record a manual usage observation (0-100)\n  \
   limit-hit <provider> [--note TEXT]           Record that a provider just returned a 429/limit error\n  \
-  start-window                     Start Claude's 5h limit clock now (cheap haiku ping)\n  \
-  alert                            Push Telegram alerts on level transitions (ok/warning/critical)\n\
+  start-window                      Start Claude's 5h limit clock now (cheap haiku ping)\n  \
+  alert                             Push Telegram alerts on level transitions (ok/warning/critical)\n  \
+  budget check <provider> <estimate>          Refuse dispatches that would cross hard daily/weekly ceilings\n  \
+  budget record <provider> <tokens> [--at-unix TS]   Record actual tokens a dispatch consumed\n\
 \nProviders: claude-pro, zai-codeplus, chatgpt-plus, ollama-pro, ollama-local\n\nNote: --note TEXT is visible via `ps` and shell history. Do not include\nsecrets, tokens, or sensitive context in note arguments.\n"
 }
 
@@ -281,6 +284,94 @@ fn main() -> ExitCode {
         "alert" => {
             alert::run(&conn, &cfg);
             ExitCode::SUCCESS
+        }
+        "budget" => {
+            let mut rest = args[2..].iter();
+            let sub = rest.next().map(String::as_str).unwrap_or("");
+            match sub {
+                "record" => {
+                    let provider = match rest.next() {
+                        Some(p) => p.clone(),
+                        None => {
+                            eprintln!(
+                                "usage: ai-usage budget record <provider> <tokens> [--at-unix TS]"
+                            );
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                    if !PROVIDERS.contains(&provider.as_str()) {
+                        eprintln!("unknown provider: {provider}. Valid: {:?}", PROVIDERS);
+                        return ExitCode::FAILURE;
+                    }
+                    let tokens: u64 = match rest.next().and_then(|t| t.parse().ok()) {
+                        Some(t) => t,
+                        None => {
+                            eprintln!("tokens must be a non-negative integer");
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                    let at_unix = rest
+                        .next()
+                        .zip(rest.next())
+                        .and_then(|(flag, val)| {
+                            (flag == "--at-unix")
+                                .then_some(())
+                                .and_then(|_| val.parse().ok())
+                        })
+                        .unwrap_or_else(budget::now_unix);
+                    if let Err(e) = db::record_spend(&conn, &provider, tokens, at_unix) {
+                        eprintln!("db error: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                    println!("recorded");
+                    ExitCode::SUCCESS
+                }
+                "check" => {
+                    // usage: budget check <provider> [estimate_tokens]
+                    let provider = match rest.next() {
+                        Some(p) => p.clone(),
+                        None => {
+                            eprintln!("usage: ai-usage budget check <provider> [estimate_tokens]");
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                    if !PROVIDERS.contains(&provider.as_str()) {
+                        eprintln!("unknown provider: {provider}. Valid: {:?}", PROVIDERS);
+                        return ExitCode::FAILURE;
+                    }
+                    let estimate: Option<u64> = match rest.next() {
+                        Some(t) => match t.parse() {
+                            Ok(v) => Some(v),
+                            Err(_) => {
+                                eprintln!("estimate must be a non-negative integer");
+                                return ExitCode::FAILURE;
+                            }
+                        },
+                        None => None,
+                    };
+                    let Some(estimate) = estimate else {
+                        eprintln!(
+                            "refused: no cost estimate — every dispatch must declare its \
+                             estimated tokens before running (budget check <provider> <tokens>)"
+                        );
+                        return ExitCode::FAILURE;
+                    };
+                    let decision =
+                        budget::check(&conn, &cfg, &provider, estimate, budget::now_unix());
+                    if decision.allowed {
+                        println!("{}", decision.message);
+                        ExitCode::SUCCESS
+                    } else {
+                        eprintln!("{}", decision.message);
+                        ExitCode::FAILURE
+                    }
+                }
+                other => {
+                    eprintln!("unknown budget subcommand: {other}");
+                    eprintln!("usage: ai-usage budget check <provider> <estimate> | budget record <provider> <tokens> [--at-unix TS]");
+                    ExitCode::FAILURE
+                }
+            }
         }
         other => {
             eprintln!("unknown command: {other}\n");

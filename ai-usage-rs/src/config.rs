@@ -20,6 +20,14 @@ pub struct ProviderConfig {
     pub endpoint: Option<String>,
     #[serde(default)]
     pub note: Option<String>,
+    /// Hard daily token ceiling for this provider's plan (0/absent = no cap).
+    /// The budget guard refuses any dispatch whose projected usage would
+    /// cross it, so a nominal 10k/day plan cannot silently reach 18k.
+    #[serde(default)]
+    pub daily_token_budget: Option<u64>,
+    /// Hard rolling-7-day ceiling for this provider's plan.
+    #[serde(default)]
+    pub weekly_token_budget: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -45,6 +53,8 @@ fn ollama_local_config() -> ProviderConfig {
         api_key_env: None,
         endpoint: Some("http://localhost:11434/api/tags".to_string()),
         note: Some("Local Ollama models are unmetered.".to_string()),
+        daily_token_budget: None,
+        weekly_token_budget: None,
     }
 }
 
@@ -61,6 +71,8 @@ impl Config {
                 api_key_env: None,
                 endpoint: None,
                 note: Some("Exact OAuth quota via Hermes when available.".to_string()),
+                daily_token_budget: None,
+                weekly_token_budget: None,
             },
         );
         providers.insert(
@@ -71,6 +83,8 @@ impl Config {
                 api_key_env: Some("ZAI_API_KEY".to_string()),
                 endpoint: Some("https://api.z.ai/api/monitor/usage/quota/limit".to_string()),
                 note: None,
+                daily_token_budget: None,
+                weekly_token_budget: None,
             },
         );
         providers.insert(
@@ -81,6 +95,8 @@ impl Config {
                 api_key_env: None,
                 endpoint: None,
                 note: Some("Exact Codex quota via Hermes OAuth when available.".to_string()),
+                daily_token_budget: None,
+                weekly_token_budget: None,
             },
         );
         providers.insert(
@@ -93,6 +109,8 @@ impl Config {
                 note: Some(
                     "Ollama cloud subscription usage has no documented quota endpoint.".to_string(),
                 ),
+                daily_token_budget: None,
+                weekly_token_budget: None,
             },
         );
         providers.insert("ollama-local".to_string(), ollama_local_config());
