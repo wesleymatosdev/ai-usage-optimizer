@@ -14,7 +14,7 @@ use std::env;
 fn window_label(unit: i64) -> &'static str {
     match unit {
         3 => "5h",
-        6 => "monthly",
+        6 => "weekly",
         _ => "window",
     }
 }
