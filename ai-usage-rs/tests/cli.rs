@@ -199,3 +199,74 @@ fn recommend_json_exposes_every_provider_with_explicit_verdicts() {
     assert_eq!(parsed["excluded"]["ollama-local"], "unavailable");
     assert_eq!(parsed["excluded"]["ollama-pro"], "unknown");
 }
+
+#[test]
+fn local_first_prefers_unmetered_runtime_when_metered_options_are_not_fresher() {
+    let (_s, cfg, db) = sandbox_paths("localfirst");
+
+    let (_, stdout, _) = run(&["collect"], &cfg, &db);
+    assert!(stdout.contains("ollama-local"), "collect ran: {stdout}");
+    run(
+        &["observe", "ollama-local", "0", "--note", "cli test local"],
+        &cfg,
+        &db,
+    );
+    run(
+        &["observe", "claude-pro", "45", "--note", "cli test"],
+        &cfg,
+        &db,
+    );
+
+    // claude-pro at 45% has headroom, but ollama-local (0%, unmetered,
+    // local-first policy) must win the plain recommend.
+    let (_, stdout, _) = run(&["recommend"], &cfg, &db);
+    assert!(
+        stdout.contains("ollama-local"),
+        "local-first routes to the unmetered runtime: {stdout}"
+    );
+    assert!(
+        !stdout.contains("claude-pro ("),
+        "metered provider suppressed by local-first: {stdout}"
+    );
+}
+
+#[test]
+fn local_first_can_be_disabled_in_config() {
+    let (_s, cfg, db) = sandbox_paths("localfirst-off");
+
+    std::fs::write(
+        &cfg,
+        r#"{
+          "thresholds": {"warning": 90, "critical": 95},
+          "local_first": false,
+          "rotation_order": ["claude-pro", "zai-codeplus", "chatgpt-plus", "ollama-pro", "ollama-local"],
+          "providers": {
+            "claude-pro": {"kind": "claude_local", "five_hour_token_budget": 225000},
+            "zai-codeplus": {"kind": "zai_quota", "api_key_env": "ZAI_API_KEY", "endpoint": "https://api.z.ai/api/monitor/usage/quota/limit"},
+            "chatgpt-plus": {"kind": "hermes_account_quota"},
+            "ollama-pro": {"kind": "manual"},
+            "ollama-local": {"kind": "ollama_local", "endpoint": "http://localhost:9/api/tags"}
+          }
+        }"#,
+    )
+    .expect("sandbox config");
+
+    // Discriminating scenario for the toggle: local at 20% (used, not fresh),
+    // claude at 18% (less used, but within the suppression window — a plain
+    // local-first policy would still suppress claude and pick local... no:
+    // with the toggle OFF, pure percent ranking must pick claude-pro at 18%).
+    run(
+        &["observe", "ollama-local", "20", "--note", "cli test"],
+        &cfg,
+        &db,
+    );
+    run(
+        &["observe", "claude-pro", "18", "--note", "cli test"],
+        &cfg,
+        &db,
+    );
+
+    // local_first=false → pure percent ranking: claude-pro (18%) wins.
+    let parsed = recommend_json(&cfg, &db);
+    assert_eq!(parsed["recommended"], "claude-pro");
+}

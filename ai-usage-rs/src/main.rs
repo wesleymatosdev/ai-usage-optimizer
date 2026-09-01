@@ -444,6 +444,24 @@ fn recommendation(
     cfg: &config::Config,
     states: &std::collections::HashMap<String, db::Observation>,
 ) -> Recommendation {
+    // Local-first: prefer the unmetered local runtime. A metered provider
+    // only wins when its reading is at least LOCAL_FIRST_MARGIN points
+    // FRESHER than the local reading — its capacity advantage has to be
+    // worth the metered spend. (Comparing the other direction would only
+    // ever suppress candidates that would lose the pure-percent ranking
+    // anyway, making the policy a no-op.)
+    const LOCAL_FIRST_MARGIN: f64 = 25.0;
+    let local_reading = states.get("ollama-local").and_then(|s| s.percent);
+    let local_first_suppresses = |provider: &str, pct: f64| -> bool {
+        if !cfg.local_first || provider == "ollama-local" {
+            return false;
+        }
+        match local_reading {
+            Some(local_pct) => pct + LOCAL_FIRST_MARGIN > local_pct,
+            None => false,
+        }
+    };
+
     let mut candidates: Vec<(f64, &str)> = cfg
         .rotation_order
         .iter()
@@ -452,6 +470,7 @@ fn recommendation(
                 .get(p)
                 .and_then(|s| s.percent)
                 .filter(|&pct| pct < cfg.thresholds.warning)
+                .filter(|&pct| !local_first_suppresses(p, pct))
                 .map(|pct| (pct, p.as_str()))
         })
         .collect();

@@ -178,4 +178,11 @@ mod tests {
         assert_eq!(out[0].verdict, Verdict::Eligible);
         assert_eq!(out[1].verdict, Verdict::Unknown);
     }
+
+    #[test]
+    fn classify_all_covers_providers_missing_from_the_state_map() {
+        let out = classify_all(&cfg(), &HashMap::new());
+        assert!(out.iter().all(|c| c.verdict == Verdict::Unknown));
+        assert_eq!(out.len(), 5);
+    }
 }

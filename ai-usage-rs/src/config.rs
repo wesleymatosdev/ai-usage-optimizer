@@ -27,6 +27,15 @@ pub struct Config {
     pub thresholds: Thresholds,
     pub rotation_order: Vec<String>,
     pub providers: std::collections::HashMap<String, ProviderConfig>,
+    /// When true (default), an unmetered local runtime with a verified
+    /// reading is preferred over metered providers unless they are far less
+    /// used (see recommendation()).
+    #[serde(default = "default_true")]
+    pub local_first: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn ollama_local_config() -> ProviderConfig {
@@ -101,6 +110,7 @@ impl Config {
                 "ollama-local".to_string(),
             ],
             providers,
+            local_first: true,
         }
     }
 }
