@@ -13,6 +13,7 @@ mod collectors;
 mod config;
 mod db;
 mod route;
+mod routing;
 
 use std::env;
 use std::path::PathBuf;
@@ -42,34 +43,33 @@ Commands:\n  \
 }
 
 fn default_config_path() -> PathBuf {
+    // Exact file path when overridden; otherwise the HOME-based default.
+    if let Some(p) = env::var_os("AI_USAGE_CONFIG_PATH") {
+        return PathBuf::from(p);
+    }
     dirs_config().join("ai-usage-optimizer").join("config.json")
 }
 
 fn default_db_path() -> PathBuf {
+    if let Some(p) = env::var_os("AI_USAGE_DB_PATH") {
+        return PathBuf::from(p);
+    }
     dirs_data().join("ai-usage-optimizer").join("usage.sqlite3")
 }
 
 fn dirs_config() -> PathBuf {
-    env::var_os("AI_USAGE_CONFIG_PATH")
+    env::var_os("HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_default()
-                .join(".config")
-        })
+        .unwrap_or_default()
+        .join(".config")
 }
 
 fn dirs_data() -> PathBuf {
-    env::var_os("AI_USAGE_DB_PATH")
+    env::var_os("HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_default()
-                .join(".local")
-                .join("share")
-        })
+        .unwrap_or_default()
+        .join(".local")
+        .join("share")
 }
 
 fn main() -> ExitCode {
@@ -117,26 +117,34 @@ fn main() -> ExitCode {
             let states = db::latest(&conn);
             let rec = recommendation(&cfg, &states);
             if json_mode {
-                let candidates: Vec<serde_json::Value> = cfg
-                    .rotation_order
+                // Explicit verdicts for EVERY rotation-order provider — the
+                // silent filter_map that dropped unknown providers is what
+                // made "unknown" and "exhausted" indistinguishable.
+                let candidates: Vec<serde_json::Value> = routing::classify_all(&cfg, &states)
                     .iter()
-                    .filter_map(|p| {
-                        states.get(p).map(|s| {
-                            serde_json::json!({
-                                "provider": p,
-                                "percent": s.percent,
-                                "source": s.source,
-                                "note": s.note,
-                                "has_headroom": s.percent.is_some_and(|pct| pct < cfg.thresholds.warning),
-                            })
+                    .map(|c| {
+                        serde_json::json!({
+                            "provider": c.provider,
+                            "percent": c.percent,
+                            "source": c.source,
+                            "note": c.note,
+                            "verdict": c.verdict.as_str(),
+                            "has_headroom": c.has_headroom,
                         })
                     })
                     .collect();
+                let excluded: serde_json::Map<String, serde_json::Value> =
+                    routing::classify_all(&cfg, &states)
+                        .iter()
+                        .filter(|c| c.verdict != routing::Verdict::Eligible || !c.has_headroom)
+                        .map(|c| (c.provider.clone(), serde_json::json!(c.verdict.as_str())))
+                        .collect();
                 let out = serde_json::json!({
                     "recommended": rec.provider,
                     "headroom_percent": rec.headroom,
                     "message": rec.text,
                     "candidates": candidates,
+                    "excluded": excluded,
                 });
                 println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
             } else {
@@ -325,6 +333,16 @@ fn extract_note(rest: &[String]) -> Option<String> {
 }
 
 fn run_collect(conn: &rusqlite::Connection, cfg: &config::Config) {
+    // Collectors that hard-fail must leave an explicit UNAVAILABLE marker
+    // (percent NULL) — a silent eprintln made "quota source down" and
+    // "never checked" indistinguishable downstream.
+    fn record_failure(conn: &rusqlite::Connection, provider: &str, error: &str) {
+        let note: String = error.chars().take(200).collect();
+        if let Err(e) = db::observe(conn, provider, None, "unavailable", &note) {
+            eprintln!("db error recording {provider} unavailability: {e}");
+        }
+    }
+
     match collectors::hermes::collect("anthropic") {
         Ok(snapshot) => {
             if let Err(e) = db::observe(
@@ -358,7 +376,10 @@ fn run_collect(conn: &rusqlite::Connection, cfg: &config::Config) {
                 eprintln!("db error recording chatgpt-plus: {e}");
             }
         }
-        Err(error) => eprintln!("Hermes ChatGPT quota unavailable: {error}"),
+        Err(error) => {
+            eprintln!("Hermes ChatGPT quota unavailable: {error}");
+            record_failure(conn, "chatgpt-plus", &error);
+        }
     }
 
     match collectors::zai::collect(cfg) {
@@ -368,10 +389,13 @@ fn run_collect(conn: &rusqlite::Connection, cfg: &config::Config) {
             }
         }
         Ok(None) => eprintln!("ZAI_API_KEY is not set"),
-        Err(e) => eprintln!("Z.ai quota request failed: {e}"),
+        Err(e) => {
+            eprintln!("Z.ai quota request failed: {e}");
+            record_failure(conn, "zai-codeplus", &e);
+        }
     }
 
-    match collectors::ollama::collect() {
+    match collectors::ollama::collect(cfg) {
         Ok(snapshot) => {
             if let Err(e) = db::observe(
                 conn,
@@ -383,7 +407,10 @@ fn run_collect(conn: &rusqlite::Connection, cfg: &config::Config) {
                 eprintln!("db error recording ollama-local: {e}");
             }
         }
-        Err(error) => eprintln!("Ollama local capacity unavailable: {error}"),
+        Err(error) => {
+            eprintln!("Ollama local capacity unavailable: {error}");
+            record_failure(conn, "ollama-local", &error);
+        }
     }
 }
 

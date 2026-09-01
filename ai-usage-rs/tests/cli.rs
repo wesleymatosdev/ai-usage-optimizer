@@ -81,7 +81,15 @@ fn observe_and_recommend_round_trip_reports_verified_headroom() {
 
     let parsed = recommend_json(&cfg, &db);
     assert_eq!(parsed["recommended"], "chatgpt-plus");
-    assert_eq!(parsed["candidates"][0]["has_headroom"], true);
+    let chatgpt = parsed["candidates"]
+        .as_array()
+        .expect("candidates array")
+        .iter()
+        .find(|c| c["provider"] == "chatgpt-plus")
+        .expect("chatgpt-plus among candidates")
+        .clone();
+    assert_eq!(chatgpt["has_headroom"], true);
+    assert_eq!(chatgpt["verdict"], "eligible");
 }
 
 #[test]
@@ -117,4 +125,77 @@ fn limit_hit_marks_provider_and_recommendation_routes_around_it() {
         status.contains("limit-hit"),
         "status shows source: {status}"
     );
+}
+
+#[test]
+fn recommend_json_exposes_every_provider_with_explicit_verdicts() {
+    let (_s, cfg, db) = sandbox_paths("verdicts");
+
+    // Sandbox config FIRST so `collect` is hermetic for the local collector:
+    // a dead ollama endpoint must produce an explicit `unavailable` marker
+    // instead of silently skipping the provider. (Hermes/zai collectors may
+    // hit real local services; the observes below override those readings.)
+    std::fs::write(
+        &cfg,
+        r#"{
+          "thresholds": {"warning": 90, "critical": 95},
+          "rotation_order": ["claude-pro", "zai-codeplus", "chatgpt-plus", "ollama-pro", "ollama-local"],
+          "providers": {
+            "claude-pro": {"kind": "claude_local", "five_hour_token_budget": 225000},
+            "zai-codeplus": {"kind": "zai_quota", "api_key_env": "ZAI_API_KEY", "endpoint": "https://api.z.ai/api/monitor/usage/quota/limit"},
+            "chatgpt-plus": {"kind": "hermes_account_quota"},
+            "ollama-pro": {"kind": "manual"},
+            "ollama-local": {"kind": "ollama_local", "endpoint": "http://localhost:9/api/tags"}
+          }
+        }"#,
+    )
+    .expect("sandbox config");
+
+    let (_, stdout, _) = run(&["collect"], &cfg, &db);
+    assert!(
+        stdout.contains("unavailable"),
+        "status after collect mentions unavailable state: {stdout}"
+    );
+    run(
+        &["observe", "claude-pro", "20", "--note", "cli test"],
+        &cfg,
+        &db,
+    );
+    run(
+        &["observe", "chatgpt-plus", "25", "--note", "cli test"],
+        &cfg,
+        &db,
+    );
+    run(
+        &["observe", "zai-codeplus", "97", "--note", "cli test"],
+        &cfg,
+        &db,
+    );
+
+    let parsed = recommend_json(&cfg, &db);
+    let candidates = parsed["candidates"].as_array().expect("candidates array");
+
+    // EVERY rotation-order provider appears — unknown/unavailable states are
+    // explicit, never silently dropped.
+    assert_eq!(candidates.len(), 5, "all providers listed: {parsed}");
+    let verdict_of = |provider: &str| -> String {
+        candidates
+            .iter()
+            .find(|c| c["provider"] == provider)
+            .map(|c| c["verdict"].as_str().unwrap_or("<missing>").to_string())
+            .unwrap_or_else(|| "<missing>".to_string())
+    };
+
+    assert_eq!(verdict_of("claude-pro"), "eligible");
+    assert_eq!(verdict_of("chatgpt-plus"), "eligible");
+    assert_eq!(verdict_of("zai-codeplus"), "exhausted");
+    assert_eq!(verdict_of("ollama-local"), "unavailable");
+    assert_eq!(verdict_of("ollama-pro"), "unknown");
+
+    // Only eligible-with-headroom providers can be recommended; claude-pro
+    // (20% used → 80% headroom) beats chatgpt-plus (25% used).
+    assert_eq!(parsed["recommended"], "claude-pro");
+    assert_eq!(parsed["excluded"]["zai-codeplus"], "exhausted");
+    assert_eq!(parsed["excluded"]["ollama-local"], "unavailable");
+    assert_eq!(parsed["excluded"]["ollama-pro"], "unknown");
 }

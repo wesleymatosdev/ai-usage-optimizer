@@ -8,6 +8,8 @@
 use serde_json::Value;
 use std::time::Duration;
 
+use crate::config::Config;
+
 const OLLAMA_TAGS_URL: &str = "http://localhost:11434/api/tags";
 
 #[derive(Debug, PartialEq)]
@@ -60,11 +62,16 @@ pub(crate) fn parse_tags(body: &str) -> Result<LocalSnapshot, String> {
     })
 }
 
-pub fn collect() -> Result<LocalSnapshot, String> {
-    let body = ureq::get(OLLAMA_TAGS_URL)
+pub fn collect(cfg: &Config) -> Result<LocalSnapshot, String> {
+    let url = cfg
+        .providers
+        .get("ollama-local")
+        .and_then(|p| p.endpoint.clone())
+        .unwrap_or_else(|| OLLAMA_TAGS_URL.to_string());
+    let body = ureq::get(&url)
         .timeout(Duration::from_secs(5))
         .call()
-        .map_err(|_| "Ollama local runtime is unavailable on localhost:11434".to_string())?
+        .map_err(|_| format!("Ollama local runtime is unavailable at {url}"))?
         .into_string()
         .map_err(|_| "Ollama returned an unreadable tags response".to_string())?;
     parse_tags(&body)
