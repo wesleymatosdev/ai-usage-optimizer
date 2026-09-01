@@ -201,6 +201,44 @@ fn recommend_json_exposes_every_provider_with_explicit_verdicts() {
 }
 
 #[test]
+fn recommend_json_excludes_providers_suppressed_by_local_first_policy() {
+    let (_s, cfg, db) = sandbox_paths("localfirst-excluded");
+
+    run(&["status"], &cfg, &db);
+    run(
+        &["observe", "ollama-local", "40", "--note", "cli test local"],
+        &cfg,
+        &db,
+    );
+    run(
+        &["observe", "claude-pro", "20", "--note", "cli test"],
+        &cfg,
+        &db,
+    );
+
+    // Policy: 20 + 25 = 45 > 40 → claude-pro suppressed; ollama-local wins.
+    let parsed = recommend_json(&cfg, &db);
+    assert_eq!(parsed["recommended"], "ollama-local");
+
+    // A machine consumer must never see a policy-refused provider as
+    // dispatchable: the suppressed provider's verdict is `local-first` with
+    // no headroom, and it appears in `excluded`.
+    let claude = parsed["candidates"]
+        .as_array()
+        .expect("candidates array")
+        .iter()
+        .find(|c| c["provider"] == "claude-pro")
+        .expect("claude-pro among candidates")
+        .clone();
+    assert_eq!(
+        claude["verdict"], "local-first",
+        "verdict surface: {parsed}"
+    );
+    assert_eq!(claude["has_headroom"], false);
+    assert_eq!(parsed["excluded"]["claude-pro"], "local-first");
+}
+
+#[test]
 fn local_first_prefers_unmetered_runtime_when_metered_options_are_not_fresher() {
     let (_s, cfg, db) = sandbox_paths("localfirst");
 

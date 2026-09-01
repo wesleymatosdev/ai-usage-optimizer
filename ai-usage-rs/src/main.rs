@@ -123,8 +123,13 @@ fn main() -> ExitCode {
             if json_mode {
                 // Explicit verdicts for EVERY rotation-order provider — the
                 // silent filter_map that dropped unknown providers is what
-                // made "unknown" and "exhausted" indistinguishable.
-                let candidates: Vec<serde_json::Value> = routing::classify_all(&cfg, &states)
+                // made "unknown" and "exhausted" indistinguishable. The
+                // local-first policy is applied inside classify_all, so a
+                // policy-refused provider carries the `local-first` verdict
+                // in `candidates` AND the `excluded` map — a machine consumer
+                // never sees a suppressed provider as dispatchable.
+                let classified = routing::classify_all(&cfg, &states);
+                let candidates: Vec<serde_json::Value> = classified
                     .iter()
                     .map(|c| {
                         serde_json::json!({
@@ -138,12 +143,11 @@ fn main() -> ExitCode {
                         })
                     })
                     .collect();
-                let excluded: serde_json::Map<String, serde_json::Value> =
-                    routing::classify_all(&cfg, &states)
-                        .iter()
-                        .filter(|c| c.verdict != routing::Verdict::Eligible || !c.has_headroom)
-                        .map(|c| (c.provider.clone(), serde_json::json!(c.verdict.as_str())))
-                        .collect();
+                let excluded: serde_json::Map<String, serde_json::Value> = classified
+                    .iter()
+                    .filter(|c| c.verdict != routing::Verdict::Eligible)
+                    .map(|c| (c.provider.clone(), serde_json::json!(c.verdict.as_str())))
+                    .collect();
                 let out = serde_json::json!({
                     "recommended": rec.provider,
                     "headroom_percent": rec.headroom,
@@ -583,35 +587,16 @@ fn recommendation(
     cfg: &config::Config,
     states: &std::collections::HashMap<String, db::Observation>,
 ) -> Recommendation {
-    // Local-first: prefer the unmetered local runtime. A metered provider
-    // only wins when its reading is at least LOCAL_FIRST_MARGIN points
-    // FRESHER than the local reading — its capacity advantage has to be
-    // worth the metered spend. (Comparing the other direction would only
-    // ever suppress candidates that would lose the pure-percent ranking
-    // anyway, making the policy a no-op.)
-    const LOCAL_FIRST_MARGIN: f64 = 25.0;
-    let local_reading = states.get("ollama-local").and_then(|s| s.percent);
-    let local_first_suppresses = |provider: &str, pct: f64| -> bool {
-        if !cfg.local_first || provider == "ollama-local" {
-            return false;
-        }
-        match local_reading {
-            Some(local_pct) => pct + LOCAL_FIRST_MARGIN > local_pct,
-            None => false,
-        }
-    };
-
-    let mut candidates: Vec<(f64, &str)> = cfg
-        .rotation_order
+    // Select among ELIGIBLE-with-headroom candidates only, using the same
+    // classify_all surface that `recommend --json` exposes. The local-first
+    // policy is applied inside classify_all (single source of truth), so a
+    // provider the policy refuses carries the `local-first` verdict there
+    // and can never be recommended here.
+    let classified = routing::classify_all(cfg, states);
+    let mut candidates: Vec<(f64, &str)> = classified
         .iter()
-        .filter_map(|p| {
-            states
-                .get(p)
-                .and_then(|s| s.percent)
-                .filter(|&pct| pct < cfg.thresholds.warning)
-                .filter(|&pct| !local_first_suppresses(p, pct))
-                .map(|pct| (pct, p.as_str()))
-        })
+        .filter(|c| c.verdict == routing::Verdict::Eligible && c.has_headroom)
+        .filter_map(|c| c.percent.map(|pct| (pct, c.provider.as_str())))
         .collect();
     candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
     match candidates.first() {

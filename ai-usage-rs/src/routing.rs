@@ -7,6 +7,9 @@
 //!
 //! - `eligible`    — verified reading, below the warning threshold, no hard
 //!   limit recorded: may take work.
+//! - `local-first` — eligible with headroom on raw percentages, but the
+//!   local-first policy suppresses it because the unmetered local runtime is
+//!   comparably fresh: policy-refused, must never be dispatched.
 //! - `exhausted`   — at/above the critical threshold, or a limit-hit was
 //!   recorded: dispatches will fail.
 //! - `unknown`     — never observed: routing must not assume headroom.
@@ -16,6 +19,13 @@
 use crate::config::Config;
 use crate::db::Observation;
 use std::collections::HashMap;
+
+/// Local-first: prefer the unmetered local runtime. A metered provider only
+/// wins when its reading is at least this many points FRESHER than the local
+/// reading — its capacity advantage has to be worth the metered spend.
+/// (Comparing the other direction would only ever suppress candidates that
+/// would lose the pure-percent ranking anyway, making the policy a no-op.)
+pub const LOCAL_FIRST_MARGIN: f64 = 25.0;
 
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
@@ -27,6 +37,7 @@ fn now_unix() -> i64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
     Eligible,
+    LocalFirst,
     Exhausted,
     Unknown,
     Unavailable,
@@ -36,6 +47,7 @@ impl Verdict {
     pub fn as_str(&self) -> &'static str {
         match self {
             Verdict::Eligible => "eligible",
+            Verdict::LocalFirst => "local-first",
             Verdict::Exhausted => "exhausted",
             Verdict::Unknown => "unknown",
             Verdict::Unavailable => "unavailable",
@@ -102,13 +114,38 @@ pub fn classify(cfg: &Config, state: Option<&Observation>, provider: &str) -> Ve
 }
 
 /// Classify every provider in rotation order.
+///
+/// This is the single source of truth for verdicts: the local-first policy
+/// from `recommendation()` is applied HERE, so a provider the policy refuses
+/// is marked `local-first` with `has_headroom: false` — machine consumers
+/// reading `recommend --json` never see a suppressed provider as dispatchable.
 pub fn classify_all(
     cfg: &Config,
     states: &HashMap<String, Observation>,
 ) -> Vec<VerdictedCandidate> {
+    let local_pct = states.get("ollama-local").and_then(|s| s.percent);
+    let suppresses = |provider: &str, pct: f64| -> bool {
+        if !cfg.local_first || provider == "ollama-local" {
+            return false;
+        }
+        match local_pct {
+            Some(local_pct) => pct + LOCAL_FIRST_MARGIN > local_pct,
+            None => false,
+        }
+    };
     cfg.rotation_order
         .iter()
-        .map(|p| classify(cfg, states.get(p), p))
+        .map(|p| {
+            let mut c = classify(cfg, states.get(p), p);
+            if c.verdict == Verdict::Eligible
+                && c.has_headroom
+                && suppresses(p, c.percent.expect("eligible implies percent"))
+            {
+                c.verdict = Verdict::LocalFirst;
+                c.has_headroom = false;
+            }
+            c
+        })
         .collect()
 }
 
@@ -206,6 +243,44 @@ mod tests {
         let c = classify(&cfg(), Some(&obs(Some(91.0), "manual")), "chatgpt-plus");
         assert_eq!(c.verdict, Verdict::Eligible);
         assert!(!c.has_headroom);
+    }
+
+    #[test]
+    fn classify_all_marks_local_first_suppressed_eligible_providers() {
+        let mut states = HashMap::new();
+        states.insert("ollama-local".to_string(), obs(Some(40.0), "manual"));
+        states.insert("claude-pro".to_string(), obs(Some(20.0), "manual"));
+
+        let out = classify_all(&cfg(), &states);
+        let claude = out.iter().find(|c| c.provider == "claude-pro").unwrap();
+        // 20 + 25 = 45 > 40 → the local-first policy suppresses claude-pro
+        // even though it is eligible with headroom on raw percentages.
+        assert_eq!(claude.verdict, Verdict::LocalFirst);
+        assert!(!claude.has_headroom);
+
+        let local = out.iter().find(|c| c.provider == "ollama-local").unwrap();
+        assert_eq!(local.verdict, Verdict::Eligible);
+        assert!(local.has_headroom);
+    }
+
+    #[test]
+    fn local_first_suppression_requires_a_local_reading_and_respects_toggle() {
+        let mut states = HashMap::new();
+        states.insert("claude-pro".to_string(), obs(Some(20.0), "manual"));
+
+        // No ollama-local reading → policy cannot fire.
+        let out = classify_all(&cfg(), &states);
+        assert_eq!(out[0].verdict, Verdict::Eligible);
+        assert!(out[0].has_headroom);
+
+        // Toggle off → pure percent ranking, never suppressed.
+        let mut cfg = cfg();
+        cfg.local_first = false;
+        let mut with_local = states.clone();
+        with_local.insert("ollama-local".to_string(), obs(Some(40.0), "manual"));
+        let out = classify_all(&cfg, &with_local);
+        assert_eq!(out[0].verdict, Verdict::Eligible);
+        assert!(out[0].has_headroom);
     }
 
     #[test]
