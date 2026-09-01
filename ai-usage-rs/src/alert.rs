@@ -5,6 +5,7 @@
 //!   1. what happened (provider, percent, level, and the actual cause),
 //!   2. what it means for you (dispatches there will fail / work again),
 //!   3. what to do (switch to the provider with real headroom, or wait).
+//!
 //! Never just a level name. Token comes from TELEGRAM_BOT_TOKEN in the
 //! environment — never hardcoded.
 //!
@@ -100,7 +101,10 @@ fn compose(
         "warning" => "dispatches there may start failing soon.",
         _ => "",
     };
-    format!("ai-usage: {cause} — {impact} {}", action_line(states, provider, cfg))
+    format!(
+        "ai-usage: {cause} — {impact} {}",
+        action_line(states, provider, cfg)
+    )
 }
 
 fn send_telegram(text: &str) -> bool {
@@ -174,7 +178,11 @@ pub fn run(conn: &Connection, cfg: &Config) {
         .iter()
         .filter(|(p, lvl)| {
             **lvl != "unknown"
-                && previous.get(*p).and_then(|v| v.as_str()).unwrap_or("unknown") != **lvl
+                && previous
+                    .get(*p)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    != **lvl
         })
         .map(|(p, lvl)| (p, *lvl))
         .collect();
@@ -211,7 +219,10 @@ pub fn run(conn: &Connection, cfg: &Config) {
         let msg = compose(provider, pct, &s.source, &s.note, level, &states, cfg);
 
         let push_key = format!("__pushed_{provider}");
-        let last_push = merged.get(&push_key).and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let last_push = merged
+            .get(&push_key)
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
         let elapsed = now - last_push;
 
         if elapsed < COOLDOWN_SECS {

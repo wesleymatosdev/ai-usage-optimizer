@@ -127,7 +127,7 @@ fn main() -> ExitCode {
                                 "percent": s.percent,
                                 "source": s.source,
                                 "note": s.note,
-                                "has_headroom": s.percent.map_or(false, |pct| pct < cfg.thresholds.warning),
+                                "has_headroom": s.percent.is_some_and(|pct| pct < cfg.thresholds.warning),
                             })
                         })
                     })

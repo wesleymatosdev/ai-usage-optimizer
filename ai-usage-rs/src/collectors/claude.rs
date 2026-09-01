@@ -148,7 +148,7 @@ pub(crate) fn parse_iso_to_unix(ts: &str) -> Option<f64> {
     // days since epoch (days_from_civil, Howard Hinnant algorithm)
     let yy = if mo <= 2 { y - 1 } else { y };
     let era = if yy >= 0 { yy } else { yy - 399 } / 400;
-    let yoe = (yy - era * 400) as i64;
+    let yoe = yy - era * 400;
     let mp = (mo + 9) % 12;
     let doy = (153 * mp + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
@@ -216,7 +216,7 @@ fn calibrate_from_cache(c: &CacheInfo, now: f64) -> Option<u64> {
     if c.five_raw < CALIB_MIN_PCT {
         return None;
     }
-    if c.five_reset.map_or(false, |r| now >= r) {
+    if c.five_reset.is_some_and(|r| now >= r) {
         return None; // window expired; its percentage no longer maps to tokens
     }
     let to = c.fetched_ms / 1000.0;
@@ -246,14 +246,14 @@ pub fn collect(cfg: &Config) -> (f64, String, String) {
     };
 
     let age_min = (now - c.fetched_ms / 1000.0) / 60.0;
-    let week_live = if c.week_reset.map_or(false, |r| now >= r) {
+    let week_live = if c.week_reset.is_some_and(|r| now >= r) {
         0.0
     } else {
         c.week_raw
     };
 
     let (five_pct, five_note) = if age_min <= FRESH_MIN {
-        let pct = if c.five_reset.map_or(false, |r| now >= r) {
+        let pct = if c.five_reset.is_some_and(|r| now >= r) {
             0.0
         } else {
             c.five_raw
