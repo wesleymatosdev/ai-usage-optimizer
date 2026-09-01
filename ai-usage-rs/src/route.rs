@@ -194,7 +194,13 @@ pub fn decide(
     req: &RouteRequest,
     thresholds: &Thresholds,
 ) -> RouteDecision {
-    let mut ranked: Vec<RouteCandidate> = states
+    // `fit_with_headroom`: this provider explicitly fits the requested task
+    // class AND has verified headroom (below the warning line) — a
+    // genuinely usable, on-task candidate, not just a cheap one.
+    // `mismatched`: this provider explicitly does NOT fit the requested
+    // task class (task_fitness is non-empty and excludes it). Empty
+    // task_fitness is neutral — neither flag applies.
+    let mut scored: Vec<(RouteCandidate, bool, bool)> = states
         .iter()
         .filter_map(|s| {
             score(s, req, thresholds).map(|(total, reason, near_limit)| {
@@ -205,22 +211,49 @@ pub fn decide(
                 } else {
                     0.2
                 };
-                RouteCandidate {
+                let fits = !s.task_fitness.is_empty() && s.task_fitness.contains(&req.task_class);
+                let mismatched =
+                    !s.task_fitness.is_empty() && !s.task_fitness.contains(&req.task_class);
+                let candidate = RouteCandidate {
                     provider: s.provider.clone(),
                     reason,
                     confidence,
                     score: total,
-                }
+                };
+                (candidate, fits && !near_limit, mismatched)
             })
         })
         .collect();
 
-    ranked.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
+    scored.sort_by(|a, b| {
+        b.0.score
+            .partial_cmp(&a.0.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
+    // Gate: cost tier and raw headroom score alone must never let an
+    // explicitly unfit provider outrank a provider that both fits the task
+    // class and has verified headroom. Weighting tricks (bigger fitness
+    // bonus) only shift *where* the crossover happens; they don't remove
+    // it. This gate removes it outright: if the top-scored pick is a known
+    // mismatch and a fit-with-headroom alternative exists, promote the
+    // best-scoring such alternative (scored list is already sorted, so the
+    // first match found after the top is the best one).
+    if let Some((_, _, top_mismatched)) = scored.first() {
+        if *top_mismatched {
+            if let Some(idx) = scored
+                .iter()
+                .position(|(_, fit_with_headroom, _)| *fit_with_headroom)
+            {
+                if idx != 0 {
+                    let promoted = scored.remove(idx);
+                    scored.insert(0, promoted);
+                }
+            }
+        }
+    }
+
+    let ranked: Vec<RouteCandidate> = scored.into_iter().map(|(c, _, _)| c).collect();
     let recommended = ranked.first().cloned();
     RouteDecision {
         recommended,
@@ -411,6 +444,45 @@ mod tests {
             &thresholds(),
         );
         assert_eq!(decision.recommended.unwrap().provider, "chatgpt-plus");
+    }
+
+    #[test]
+    fn fit_with_headroom_beats_cheap_unfit_provider() {
+        // Reproduces the live defect found in review: an unfit, cheap
+        // local/classifier-only provider (0% used, so a high raw headroom
+        // score) must not outrank a subscription provider that both fits
+        // the task class and has clear, verified headroom (well under the
+        // warning line). This is the exact incident class the task exists
+        // to prevent: don't let cost tier alone win over task fitness when
+        // a fit, well-provisioned alternative exists.
+        let mut classifier_only = state("ollama-local", 0.0, CostTier::Local);
+        classifier_only.task_fitness = vec![TaskClass::Classifier];
+
+        let mut reasoning_fit = state("claude-pro", 32.0, CostTier::Subscription);
+        reasoning_fit.task_fitness = vec![TaskClass::Reasoning];
+
+        let decision = decide(
+            &[classifier_only, reasoning_fit],
+            &req(TaskClass::Reasoning, 600),
+            &thresholds(),
+        );
+        assert_eq!(decision.recommended.unwrap().provider, "claude-pro");
+    }
+
+    #[test]
+    fn mismatch_gate_does_not_fire_without_a_fit_alternative() {
+        // If the only candidates are unfit, the gate must not exclude them
+        // (no fit-with-headroom alternative exists to promote) — an unfit
+        // provider is still better than no provider.
+        let mut classifier_only = state("ollama-local", 0.0, CostTier::Local);
+        classifier_only.task_fitness = vec![TaskClass::Classifier];
+
+        let decision = decide(
+            &[classifier_only],
+            &req(TaskClass::Reasoning, 600),
+            &thresholds(),
+        );
+        assert_eq!(decision.recommended.unwrap().provider, "ollama-local");
     }
 
     #[test]
