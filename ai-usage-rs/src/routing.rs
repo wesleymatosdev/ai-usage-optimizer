@@ -8,8 +8,12 @@
 //! - `eligible`    — verified reading, below the warning threshold, no hard
 //!   limit recorded: may take work.
 //! - `local-first` — eligible with headroom on raw percentages, but the
-//!   local-first policy suppresses it because the unmetered local runtime is
-//!   comparably fresh: policy-refused, must never be dispatched.
+//!   local-first policy suppresses it because a genuinely METERED local
+//!   reading is comparably fresh: policy-refused, must never be dispatched.
+//!   This never fires against the unmetered-local sentinel (percent 0.0,
+//!   source `ollama-local-unlimited`) — that 0.0 means "no ceiling exists",
+//!   not "0% used", and treating it as a real percentage would suppress
+//!   every metered provider any time local Ollama is reachable.
 //! - `backoff`     — a TRANSIENT session 429/rate-limit event is active
 //!   (within its TTL). Short-lived: retry shortly. Distinct from `exhausted`
 //!   because a 429 on one subagent says nothing about plan/credit state.
@@ -33,7 +37,26 @@ use std::collections::HashMap;
 /// reading — its capacity advantage has to be worth the metered spend.
 /// (Comparing the other direction would only ever suppress candidates that
 /// would lose the pure-percent ranking anyway, making the policy a no-op.)
+///
+/// This margin is only meaningful against a REAL metered percentage. The
+/// `ollama-local` collector reports `percent: 0.0` for an unmetered runtime
+/// (source `ollama-local-unlimited`) — that 0.0 is a "no ceiling exists"
+/// sentinel, not a real 0% usage reading. Comparing `pct + MARGIN > 0`
+/// against it is true for every provider at every usage level, which
+/// structurally suppresses all cloud providers any time local Ollama is up.
+/// The fix: the margin comparison only fires when the local reading is a
+/// genuine metered percentage (any other source). An unmetered local still
+/// gets preferred in practice — `recommendation()` picks the lowest percent
+/// among eligible candidates, and 0.0 already sorts first — so dropping the
+/// absolute-suppression path for the unmetered case costs nothing and
+/// restores the metered providers' visibility for every OTHER purpose
+/// (candidate listing, `excluded` map, future consumers).
 pub const LOCAL_FIRST_MARGIN: f64 = 25.0;
+
+/// The `source` value the Ollama collector writes when local capacity is
+/// unmetered (see `collectors::ollama::LocalSnapshot`). Percent 0.0 under
+/// this source is a sentinel ("no ceiling"), never a real usage reading.
+pub const UNMETERED_LOCAL_SOURCE: &str = "ollama-local-unlimited";
 
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
@@ -102,6 +125,7 @@ pub fn classify(
     };
 
     let reset_in_secs = reset_in_secs_from_note(&state.note, now_unix());
+    let raw_reset_delta = raw_reset_delta_from_note(&state.note, now_unix());
     let base = VerdictedCandidate {
         provider: provider.to_string(),
         percent: state.percent,
@@ -118,6 +142,25 @@ pub fn classify(
             ..base
         };
     };
+
+    // The window this percent was measured against has already rolled over
+    // (the note's parsed reset timestamp is in the past). Carrying the
+    // pre-reset percent forward as still-current usage is the sticky
+    // staleness bug: Wesley observed the CLI reporting 44% used while the
+    // provider's own portal had already reset to 1%. Nothing here can know
+    // the true post-reset percent without a fresh collect, so the honest
+    // state is Unknown — it forces a re-probe on the next read/collect
+    // instead of silently trusting data from a window that no longer
+    // exists. This only affects observations whose note carries a
+    // parseable reset timestamp (zai/hermes/claude-style); readings with no
+    // such note (manual, credit) are unaffected.
+    if raw_reset_delta.is_some_and(|secs| secs < 0) {
+        return VerdictedCandidate {
+            verdict: Verdict::Unknown,
+            percent: None,
+            ..base
+        };
+    }
 
     if pct >= cfg.thresholds.critical {
         return VerdictedCandidate {
@@ -159,9 +202,14 @@ pub fn classify_all(
     states: &HashMap<String, Observation>,
     backoff_providers: &std::collections::HashSet<String>,
 ) -> Vec<VerdictedCandidate> {
-    let local_pct = states.get("ollama-local").and_then(|s| s.percent);
+    let local = states.get("ollama-local");
+    let local_pct = local.and_then(|s| s.percent);
+    // An unmetered local reading (the collector's real "no ceiling" sentinel,
+    // percent 0.0 under source `ollama-local-unlimited`) must not act as a
+    // real 0% floor in the margin comparison — see LOCAL_FIRST_MARGIN docs.
+    let local_is_unmetered_sentinel = local.is_some_and(|s| s.source == UNMETERED_LOCAL_SOURCE);
     let suppresses = |provider: &str, pct: f64| -> bool {
-        if !cfg.local_first || provider == "ollama-local" {
+        if !cfg.local_first || provider == "ollama-local" || local_is_unmetered_sentinel {
             return false;
         }
         match local_pct {
@@ -186,17 +234,19 @@ pub fn classify_all(
         .collect()
 }
 
-/// Parse a reset timestamp out of an observation note and return seconds
-/// from `now` until the reset. Understands the shapes the collectors emit:
-///   "(resets 2026-09-01T12:00:00+00:00)"  /  "(resets in 47m)"
-/// Returns None when the note carries no parseable reset.
-pub fn reset_in_secs_from_note(note: &str, now_unix: i64) -> Option<i64> {
+/// Parse a reset timestamp out of an observation note and return the RAW
+/// (possibly negative) delta in seconds: `parsed_reset - now`. Negative means
+/// the window has already rolled over. Shared by the public
+/// `reset_in_secs_from_note` (which clamps to 0 for display) and the
+/// window-staleness check in `classify` (which needs the negative signal).
+fn raw_reset_delta_from_note(note: &str, now_unix: i64) -> Option<i64> {
     let idx = note.find("(resets ")?;
     let rest = &note[idx + "(resets ".len()..];
     let end = rest.find(')')?;
     let body = &rest[..end];
 
-    // "resets in 47m" style (relative).
+    // "resets in 47m" style (relative) — always future by construction, a
+    // collector never emits a negative relative offset.
     if let Some(stripped) = body.strip_prefix("in ") {
         let digits: String = stripped
             .chars()
@@ -217,10 +267,20 @@ pub fn reset_in_secs_from_note(note: &str, now_unix: i64) -> Option<i64> {
         }
     }
 
-    // Absolute timestamp — reuse the collectors' ISO parser.
+    // Absolute timestamp — reuse the collectors' ISO parser. This CAN be
+    // negative: the window already rolled over and the reading predates it.
     let ts = crate::collectors::claude::parse_iso_to_unix(body)?;
-    let delta = (ts as i64) - now_unix;
-    Some(delta.max(0))
+    Some((ts as i64) - now_unix)
+}
+
+/// Parse a reset timestamp out of an observation note and return seconds
+/// from `now` until the reset. Understands the shapes the collectors emit:
+///   "(resets 2026-09-01T12:00:00+00:00)"  /  "(resets in 47m)"
+/// Returns None when the note carries no parseable reset. Clamped to 0 for
+/// display — callers needing to detect an already-passed reset (staleness)
+/// should use `raw_reset_delta_from_note` instead.
+pub fn reset_in_secs_from_note(note: &str, now_unix: i64) -> Option<i64> {
+    raw_reset_delta_from_note(note, now_unix).map(|d| d.max(0))
 }
 
 #[cfg(test)]
@@ -239,6 +299,13 @@ mod tests {
             note: "test".to_string(),
             at: "2026-09-01T00:00:00Z".to_string(),
         }
+    }
+
+    /// Real wall-clock unix seconds — used only by the window-reset staleness
+    /// tests, since `classify` reads the actual clock internally (it has no
+    /// injectable `now` parameter).
+    fn real_now_unix() -> i64 {
+        now_unix()
     }
 
     #[test]
@@ -335,6 +402,9 @@ mod tests {
 
     #[test]
     fn classify_all_marks_local_first_suppressed_eligible_providers() {
+        // A METERED local reading (source "manual", NOT the unmetered
+        // sentinel) is what the local-first margin comparison must fire
+        // against — this is the genuine suppression case.
         let mut states = HashMap::new();
         states.insert("ollama-local".to_string(), obs(Some(40.0), "manual"));
         states.insert("claude-pro".to_string(), obs(Some(20.0), "manual"));
@@ -349,6 +419,64 @@ mod tests {
         let local = out.iter().find(|c| c.provider == "ollama-local").unwrap();
         assert_eq!(local.verdict, Verdict::Eligible);
         assert!(local.has_headroom);
+    }
+
+    #[test]
+    fn unmetered_local_sentinel_never_suppresses_a_metered_provider_at_low_usage() {
+        // THE bug: ollama-local reports percent 0.0 under source
+        // "ollama-local-unlimited" when it is genuinely unmetered — that 0.0
+        // is a sentinel ("no ceiling"), not a real reading. The old
+        // comparison (pct + 25 > 0) was true for every provider at every
+        // usage level, structurally suppressing all cloud providers whenever
+        // local Ollama was reachable. A metered provider at 1% must stay
+        // eligible.
+        let mut states = HashMap::new();
+        states.insert(
+            "ollama-local".to_string(),
+            obs(Some(0.0), UNMETERED_LOCAL_SOURCE),
+        );
+        states.insert("claude-pro".to_string(), obs(Some(1.0), "manual"));
+
+        let out = classify_all(&cfg(), &states, &HashSet::new());
+        let claude = out.iter().find(|c| c.provider == "claude-pro").unwrap();
+        assert_eq!(
+            claude.verdict,
+            Verdict::Eligible,
+            "unmetered-local sentinel must never suppress a real metered reading"
+        );
+        assert!(claude.has_headroom);
+    }
+
+    #[test]
+    fn local_first_false_gives_pure_headroom_ordering_even_with_metered_local() {
+        // Toggle off: no suppression at all, regardless of whether the local
+        // reading is metered or the unmetered sentinel.
+        let mut cfg = cfg();
+        cfg.local_first = false;
+        let mut states = HashMap::new();
+        states.insert("ollama-local".to_string(), obs(Some(40.0), "manual"));
+        states.insert("claude-pro".to_string(), obs(Some(20.0), "manual"));
+
+        let out = classify_all(&cfg, &states, &HashSet::new());
+        let claude = out.iter().find(|c| c.provider == "claude-pro").unwrap();
+        assert_eq!(claude.verdict, Verdict::Eligible);
+        assert!(claude.has_headroom);
+    }
+
+    #[test]
+    fn empty_local_state_leaves_all_metered_providers_eligible() {
+        // No ollama-local observation at all → the policy has nothing to
+        // compare against and must never suppress.
+        let mut states = HashMap::new();
+        states.insert("claude-pro".to_string(), obs(Some(20.0), "manual"));
+        states.insert("zai-codeplus".to_string(), obs(Some(30.0), "manual"));
+
+        let out = classify_all(&cfg(), &states, &HashSet::new());
+        for provider in ["claude-pro", "zai-codeplus"] {
+            let c = out.iter().find(|c| c.provider == provider).unwrap();
+            assert_eq!(c.verdict, Verdict::Eligible, "{provider}: {c:?}");
+            assert!(c.has_headroom, "{provider}: {c:?}");
+        }
     }
 
     #[test]
@@ -421,5 +549,125 @@ mod tests {
         let out = classify_all(&cfg(), &HashMap::new(), &HashSet::new());
         assert!(out.iter().all(|c| c.verdict == Verdict::Unknown));
         assert_eq!(out.len(), 5);
+    }
+
+    // --- sticky limit-hit / stale window-reset regression --------------------
+    //
+    // Wesley observed a 43-point staleness gap: the CLI reported 44% used on
+    // a provider whose window had already reset (the portal showed 1%). The
+    // stored percent was measured against a window that has since rolled
+    // over; carrying it forward as still-current usage is the sticky bug.
+
+    #[test]
+    fn a_reading_whose_window_has_already_reset_becomes_unknown_not_stale_percent() {
+        // Simulates the exact incident: a 44%-used observation whose parsed
+        // reset timestamp is 10 minutes in the PAST (the window already
+        // rolled over — the real post-reset percent, per the provider's own
+        // portal, was ~1%). The stale 44% must never be reported as current.
+        // `classify` reads the real wall clock internally, so the reset must
+        // be anchored to it, not to a synthetic epoch.
+        let now = real_now_unix();
+        let past_reset = now - 600; // 10 minutes ago
+        let note = format!("5h 44% (resets {})", iso_from_unix_for_test(past_reset));
+        let stale = Observation {
+            percent: Some(44.0),
+            source: "server-cache".to_string(),
+            note,
+            at: "2026-09-01T00:00:00Z".to_string(),
+        };
+        let c = classify(&cfg(), Some(&stale), "claude-pro", false);
+        assert_eq!(
+            c.verdict,
+            Verdict::Unknown,
+            "a reading past its own window reset must not report stale usage"
+        );
+        assert_eq!(
+            c.percent, None,
+            "the stale percent must not leak through as current"
+        );
+    }
+
+    #[test]
+    fn a_reading_whose_window_has_not_reset_yet_stays_eligible() {
+        // Same shape, but the reset is still 10 minutes in the FUTURE — the
+        // reading is current and must classify normally.
+        let now = real_now_unix();
+        let future_reset = now + 600;
+        let note = format!("5h 44% (resets {})", iso_from_unix_for_test(future_reset));
+        let fresh = Observation {
+            percent: Some(44.0),
+            source: "server-cache".to_string(),
+            note,
+            at: "2026-09-01T00:00:00Z".to_string(),
+        };
+        let c = classify(&cfg(), Some(&fresh), "claude-pro", false);
+        assert_eq!(c.verdict, Verdict::Eligible);
+        assert_eq!(c.percent, Some(44.0));
+    }
+
+    #[test]
+    fn a_fresh_post_reset_reading_recovers_eligibility_after_the_window_rolls() {
+        // Full sequence: limit-hit (backoff) → window reset → a fresh
+        // collect reports the real low post-reset percent → eligible again.
+        // This proves recovery is driven by a NEW observation, not by
+        // continuing to trust the pre-reset one.
+        let now = real_now_unix();
+
+        // 1. Stale 44% reading from before the reset — must not stick.
+        let stale = Observation {
+            percent: Some(44.0),
+            source: "server-cache".to_string(),
+            note: format!("5h 44% (resets {})", iso_from_unix_for_test(now - 600)),
+            at: "2026-09-01T00:00:00Z".to_string(),
+        };
+        let stale_c = classify(&cfg(), Some(&stale), "claude-pro", false);
+        assert_eq!(stale_c.verdict, Verdict::Unknown);
+
+        // 2. A fresh collect after the reset reports the real, low percent
+        // with a NEW future reset — this must classify as eligible.
+        let fresh = Observation {
+            percent: Some(1.0),
+            source: "server-cache".to_string(),
+            note: format!("5h 1% (resets {})", iso_from_unix_for_test(now + 5 * 3600)),
+            at: "2026-09-01T00:10:00Z".to_string(),
+        };
+        let fresh_c = classify(&cfg(), Some(&fresh), "claude-pro", false);
+        assert_eq!(fresh_c.verdict, Verdict::Eligible);
+        assert_eq!(fresh_c.percent, Some(1.0));
+        assert!(fresh_c.has_headroom);
+    }
+
+    #[test]
+    fn readings_without_a_parseable_reset_note_are_unaffected_by_staleness_check() {
+        // manual/credit observations carry no reset note at all — the
+        // staleness check must be a no-op for them, not an accidental
+        // Unknown downgrade.
+        let c = classify(
+            &cfg(),
+            Some(&obs(Some(44.0), "manual")),
+            "claude-pro",
+            false,
+        );
+        assert_eq!(c.verdict, Verdict::Eligible);
+        assert_eq!(c.percent, Some(44.0));
+    }
+
+    /// Local RFC3339-ish ISO formatter for test notes (mirrors db::iso_from_unix).
+    fn iso_from_unix_for_test(unix: i64) -> String {
+        let secs = unix.max(0);
+        let days = secs / 86400;
+        let rem = secs % 86400;
+        let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+        let z = days + 719468;
+        let era = if z >= 0 { z } else { z - 146096 } / 146097;
+        let doe = z - era * 146097;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let mth = if mp < 10 { mp + 3 } else { mp - 9 };
+        let year = if mth <= 2 { y + 1 } else { y };
+        format!("{year:04}-{mth:02}-{d:02}T{h:02}:{m:02}:{s:02}+00:00")
     }
 }
