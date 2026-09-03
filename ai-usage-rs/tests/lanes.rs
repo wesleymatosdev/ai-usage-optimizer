@@ -96,7 +96,13 @@ fn recommend_json_reports_reset_windows_when_known() {
             .as_secs() as i64;
         let then = now + 3600; // 1h from now
                                // Format as RFC3339 UTC using a tiny civil-from-days conversion.
-        let days = now.div_euclid(86400);
+                               // BUG (fixed here): days must be derived from `then`, not `now` —
+                               // using `now`'s day with `then`'s time-of-day silently produced a
+                               // PAST timestamp whenever the 1h offset crossed a UTC midnight
+                               // boundary, which the new window-reset staleness check (routing.rs)
+                               // would then correctly — but wrongly for this test — classify as
+                               // Unknown instead of Eligible.
+        let days = then.div_euclid(86400);
         let secs = then.rem_euclid(86400);
         let z = days + 719_468;
         let era = z / 146_097;
@@ -108,8 +114,8 @@ fn recommend_json_reports_reset_windows_when_known() {
         let d = doy - (153 * mp + 2) / 5 + 1;
         let m = if mp < 10 { mp + 3 } else { mp - 9 };
         let yy = if m <= 2 { y + 1 } else { y };
-        let (h, mi, _s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
-        format!("{yy:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{mi:02}+00:00")
+        let (h, mi, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+        format!("{yy:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}+00:00")
     };
 
     let out = std::process::Command::new(EXE)

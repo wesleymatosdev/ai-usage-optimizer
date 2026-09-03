@@ -323,3 +323,149 @@ fn local_first_can_be_disabled_in_config() {
     let parsed = recommend_json(&cfg, &db);
     assert_eq!(parsed["recommended"], "claude-pro");
 }
+
+#[test]
+fn unmetered_local_sentinel_does_not_suppress_a_metered_provider_at_low_usage() {
+    // THE local_first bug, proven end-to-end against the REAL ollama
+    // collector: a tiny mock HTTP server stands in for Ollama's /api/tags
+    // and returns a genuine local-model tags response, so `collect` writes
+    // the actual sentinel source "ollama-local-unlimited" with percent 0.0
+    // — not a hand-typed "manual" observation. The old margin comparison
+    // (pct + 25 > 0) suppressed EVERY metered provider whenever local
+    // Ollama was reachable, no matter how low its own usage was.
+    let (_s, cfg, db) = sandbox_paths("unmetered-local-no-suppress");
+
+    let mock_addr = spawn_ollama_tags_mock();
+    std::fs::write(
+        &cfg,
+        format!(
+            r#"{{
+          "thresholds": {{"warning": 90, "critical": 95}},
+          "rotation_order": ["claude-pro", "zai-codeplus", "chatgpt-plus", "ollama-pro", "ollama-local"],
+          "providers": {{
+            "claude-pro": {{"kind": "claude_local", "five_hour_token_budget": 225000}},
+            "zai-codeplus": {{"kind": "zai_quota", "api_key_env": "ZAI_API_KEY", "endpoint": "https://api.z.ai/api/monitor/usage/quota/limit"}},
+            "chatgpt-plus": {{"kind": "hermes_account_quota"}},
+            "ollama-pro": {{"kind": "manual"}},
+            "ollama-local": {{"kind": "ollama_local", "endpoint": "http://{mock_addr}/api/tags"}}
+          }}
+        }}"#
+        ),
+    )
+    .expect("sandbox config");
+
+    let (_, stdout, _) = run(&["collect"], &cfg, &db);
+    assert!(
+        stdout.contains("ollama-local-unlimited") || stdout.contains("unmetered"),
+        "collect recorded the real unmetered-local reading: {stdout}"
+    );
+    run(
+        &["observe", "claude-pro", "1", "--note", "cli test"],
+        &cfg,
+        &db,
+    );
+
+    let parsed = recommend_json(&cfg, &db);
+    let claude = parsed["candidates"]
+        .as_array()
+        .expect("candidates array")
+        .iter()
+        .find(|c| c["provider"] == "claude-pro")
+        .expect("claude-pro among candidates")
+        .clone();
+    assert_eq!(
+        claude["verdict"], "eligible",
+        "the unmetered-local sentinel must never suppress a real metered reading: {parsed}"
+    );
+    assert_eq!(claude["has_headroom"], true, "{parsed}");
+}
+
+/// A minimal blocking HTTP mock for Ollama's /api/tags endpoint, serving one
+/// request with a real local-model response. Returns the bound address.
+fn spawn_ollama_tags_mock() -> std::net::SocketAddr {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock listener");
+    let addr = listener.local_addr().expect("mock addr");
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf); // drain the request, ignore contents
+            let body =
+                r#"{"models":[{"name":"qwen3-30b:latest"},{"name":"nomic-embed-text:latest"}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    addr
+}
+
+#[test]
+fn stale_window_reset_reading_forces_unknown_not_a_stuck_stale_percent() {
+    // THE sticky staleness bug, end-to-end: a percent-of-window observation
+    // whose parsed reset timestamp has already passed must not keep
+    // reporting as current usage. Wesley observed a 43-point gap (CLI said
+    // 44%, portal said 1%) because the stale reading was trusted forever.
+    let (_s, cfg, db) = sandbox_paths("stale-window-reset");
+
+    run(&["status"], &cfg, &db);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let past = now - 600; // 10 minutes ago — the window has already reset
+    let past_iso = iso_from_unix(past);
+    run(
+        &[
+            "observe",
+            "claude-pro",
+            "44",
+            "--note",
+            &format!("5h 44% (server, fresh); weekly 10% (resets {past_iso})"),
+        ],
+        &cfg,
+        &db,
+    );
+
+    let parsed = recommend_json(&cfg, &db);
+    let claude = parsed["candidates"]
+        .as_array()
+        .expect("candidates array")
+        .iter()
+        .find(|c| c["provider"] == "claude-pro")
+        .expect("claude-pro among candidates")
+        .clone();
+    assert_eq!(
+        claude["verdict"], "unknown",
+        "a reading past its own window reset must not stick as stale usage: {parsed}"
+    );
+    assert_eq!(
+        claude["percent"],
+        serde_json::Value::Null,
+        "the stale percent must not leak through: {parsed}"
+    );
+}
+
+/// RFC3339 UTC for unix seconds (local copy — tests can't link the bin crate).
+fn iso_from_unix(unix: i64) -> String {
+    let secs = unix.max(0);
+    let days = secs / 86400;
+    let rem = secs % 86400;
+    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mth = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if mth <= 2 { y + 1 } else { y };
+    format!("{year:04}-{mth:02}-{d:02}T{h:02}:{m:02}:{s:02}+00:00")
+}
